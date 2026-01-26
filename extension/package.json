@@ -1,0 +1,266 @@
+{
+  "name": "code-critic-notes",
+  "displayName": "Code Critic Notes",
+  "description": "Review active file or selection with Code Critic (Ollama) and post line-level suggestions into the VS Code Comments panel. Includes one-click AI fix from comment threads.",
+  "version": "0.2.64",
+  "publisher": "local",
+  "license": "MIT",
+  "dependencies": {
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7"
+  },
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:csharp",
+    "onLanguage:javascript",
+    "onView:codeCritic.chatView",
+    "onStartupFinished",
+    "onCommand:codeCritic.reviewFile",
+    "onCommand:codeCritic.reviewSelection",
+    "onCommand:codeCritic.openChat",
+    "onCommand:codeCritic.chatWithSelection",
+    "onCommand:codeCritic.clear",
+    "onCommand:codeCritic.generateProposedChange",
+    "onCommand:codeCritic.applyProposedChange",
+    "onCommand:codeCritic.regenerateProposedChange",
+    "onCommand:codeCritic.replyToAdoComment",
+    "onCommand:codeCritic.createAdoComment",
+    "onCommand:codeCritic.syncAdoComments",
+    "onCommand:codeCritic.setAdoPat",
+    "onCommand:codeCritic.clearAdoPat"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codeCritic",
+          "title": "Code Critic",
+          "icon": "media/code-critic.svg"
+        }
+      ]
+    },
+    "views": {
+      "codeCritic": [
+        {
+          "id": "codeCritic.chatView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codeCritic.reviewFile",
+        "title": "CodeCritic: Review File"
+      },
+      {
+        "command": "codeCritic.reviewSelection",
+        "title": "CodeCritic: Review Selection"
+      },
+      {
+        "command": "codeCritic.openChat",
+        "title": "CodeCritic: Open Chat"
+      },
+      {
+        "command": "codeCritic.chatWithSelection",
+        "title": "CodeCritic: Chat With Selection"
+      },
+      {
+        "command": "codeCritic.clear",
+        "title": "CodeCritic: Clear Review Comments"
+      },
+      {
+        "command": "codeCritic.discardThread",
+        "title": "CodeCritic: Discard Comment"
+      },
+      {
+        "command": "codeCritic.generateProposedChange",
+        "title": "CodeCritic: Generate Proposed Change"
+      },
+      {
+        "command": "codeCritic.applyProposedChange",
+        "title": "CodeCritic: Apply Proposed Change"
+      },
+      {
+        "command": "codeCritic.regenerateProposedChange",
+        "title": "CodeCritic: Regenerate Proposed Change"
+      },
+      {
+        "command": "codeCritic.replyToAdoComment",
+        "title": "CodeCritic: Reply to ADO Comment"
+      },
+      {
+        "command": "codeCritic.createAdoComment",
+        "title": "CodeCritic: Create New PR Comment"
+      },
+      {
+        "command": "codeCritic.syncAdoComments",
+        "title": "CodeCritic: Sync ADO PR Comments"
+      },
+      {
+        "command": "codeCritic.setAdoPat",
+        "title": "CodeCritic: Set ADO PAT"
+      },
+      {
+        "command": "codeCritic.clearAdoPat",
+        "title": "CodeCritic: Clear ADO PAT"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codeCritic.createAdoComment",
+          "when": "editorHasSelection",
+          "group": "navigation"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "codeCritic.regenerateProposedChange",
+          "when": "commentThread == codeCriticThread"
+        },
+        {
+          "command": "codeCritic.regenerateProposedChange",
+          "when": "commentThread == codeCriticThread-proposed"
+        },
+        {
+          "command": "codeCritic.regenerateProposedChange",
+          "when": "commentThread == codeCriticThread-ado"
+        },
+        {
+          "command": "codeCritic.replyToAdoComment",
+          "when": "commentThread == codeCriticThread-ado"
+        },
+        {
+          "command": "codeCritic.regenerateProposedChange",
+          "when": "commentThread == codeCriticThread-ado-proposed"
+        },
+        {
+          "command": "codeCritic.replyToAdoComment",
+          "when": "commentThread == codeCriticThread-ado-proposed"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "codeCritic.generateProposedChange",
+          "when": "commentThread == codeCriticThread-ado"
+        },
+        {
+          "command": "codeCritic.applyProposedChange",
+          "when": "commentThread == codeCriticThread-proposed"
+        },
+        {
+          "command": "codeCritic.applyProposedChange",
+          "when": "commentThread == codeCriticThread-ado-proposed"
+        },
+        {
+          "command": "codeCritic.discardThread",
+          "when": "commentThread == codeCriticThread"
+        },
+        {
+          "command": "codeCritic.discardThread",
+          "when": "commentThread == codeCriticThread-proposed"
+        },
+        {
+          "command": "codeCritic.discardThread",
+          "when": "commentThread == codeCriticThread-ado"
+        },
+        {
+          "command": "codeCritic.discardThread",
+          "when": "commentThread == codeCriticThread-ado-proposed"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Code Critic",
+      "properties": {
+        "codeCritic.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434/v1",
+          "description": "Ollama OpenAI-compatible base URL (no trailing slash). Example: http://host:11434/v1"
+        },
+        "codeCritic.model": {
+          "type": "string",
+          "default": "devstral-small-2",
+          "description": "Ollama model name/tag (e.g., devstral-small-2 or devstral-small-2:latest)."
+        },
+        "codeCritic.maxChars": {
+          "type": "number",
+          "default": 80000,
+          "description": "Max characters sent to the model per run."
+        },
+        "codeCritic.chatHistoryChars": {
+          "type": "number",
+          "default": 32000,
+          "description": "Max characters of previous chat history to include with each request. Set to 0 to send only the latest message."
+        },
+        "codeCritic.agentMaxSteps": {
+          "type": "number",
+          "default": 6,
+          "description": "Maximum number of tool steps the agent can take before stopping."
+        },
+        "codeCritic.instructionsFile": {
+          "type": "string",
+          "default": "${workspaceFolder}/.codecritic/instructions.md",
+          "description": "Path to a Markdown file with extra review rules to append to the system prompt. Supports ${workspaceFolder}, ~, absolute, or workspace-relative paths."
+        },
+        "codeCritic.generationInstructionsFile": {
+          "type": "string",
+          "default": "${workspaceFolder}/.codecritic/generation_instructions.md",
+          "description": "Path to a Markdown file with extra generation rules to append to the fix prompt. If missing, no extra rules are applied."
+        },
+        "codeCritic.methodReview.maxDependencyDepth": {
+          "type": "number",
+          "default": 1,
+          "description": "How many levels deep to include dependent symbols when reviewing a method."
+        },
+        "codeCritic.methodReview.maxDependencies": {
+          "type": "number",
+          "default": 8,
+          "description": "Maximum number of dependent symbols to include for a method review."
+        },
+        "codeCritic.showTokenEstimate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an approximate token count for the current review payload in the status bar."
+        },
+        "codeCritic.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging and keep the Code Critic output channel available."
+        },
+        "codeCritic.ado.organizationUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Azure DevOps organization URL (e.g., https://dev.azure.com/your-org)."
+        },
+        "codeCritic.ado.project": {
+          "type": "string",
+          "default": "",
+          "description": "Azure DevOps project name."
+        },
+        "codeCritic.ado.repo": {
+          "type": "string",
+          "default": "",
+          "description": "Azure DevOps repository name or ID."
+        },
+        "codeCritic.ado.prId": {
+          "type": "string",
+          "default": "",
+          "description": "Default pull request ID to sync. Leave empty to prompt or auto-detect."
+        },
+        "codeCritic.ado.autoDetectPrFromBranch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Try to detect the PR based on the current git branch."
+        }
+      }
+    }
+  }
+}

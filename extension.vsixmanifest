@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Language="en-US" Id="local.code-critic-notes" Version="0.0.3" Publisher="local" />
+    <DisplayName>Code Critic Notes</DisplayName>
+    <Description xml:space="preserve">Review active file or selection with Code Critic (Ollama) and post line-level suggestions into the VS Code Comments panel. Includes one-click AI fix from comment threads.</Description>
+  </Metadata>
+  <Installation>
+    <InstallationTarget Id="Microsoft.VisualStudio.Code" Version="[1.88.0,)" />
+  </Installation>
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />
+  </Assets>
+</PackageManifest>
