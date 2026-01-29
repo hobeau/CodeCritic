@@ -7,7 +7,14 @@ try {
   sqlite3 = null;
 }
 
-const { isDebugEnabled, getMethodReviewConfig, getChatHistoryCharLimit, getAgentMaxSteps } = require('../helpers/config');
+const {
+  isDebugEnabled,
+  getMethodReviewConfig,
+  getChatHistoryCharLimit,
+  getAgentMaxSteps,
+  isAgentMemoryEnabled,
+  getAgentMemoryCharLimit
+} = require('../helpers/config');
 const { getOutputChannel, updateTokenEstimate } = require('../helpers/output');
 const { buildMethodDependencyContext, updateSelectionContextsForEdit } = require('../helpers/context');
 const { getWorkspaceRoot, resolveWorkspacePathForTool, toWorkspaceRelativePath } = require('../helpers/workspace');
@@ -43,7 +50,64 @@ let lastDebugStackItem = null;
 let lastDebugSession = null;
 let debugListenEnabled = false;
 const DEBUG_CONTEXT_ID = 'debug_snapshot_live';
+const AGENT_MEMORY_CONTEXT_ID = 'agent_memory_summary';
+const AGENT_MEMORY_TITLE = 'Agent Memory';
 let chatModelOptions = [];
+const CHAT_TOOL_NAMES = [
+  'search',
+  'locate_file',
+  'search_symbols',
+  'workspace_symbols',
+  'document_symbols',
+  'definition',
+  'type_definition',
+  'implementation',
+  'references',
+  'hover',
+  'signature_help',
+  'call_hierarchy_prepare',
+  'call_hierarchy_incoming',
+  'call_hierarchy_outgoing',
+  'semantic_tokens',
+  'read_file',
+  'read_files',
+  'read_file_range_by_symbols',
+  'list_files',
+  'file_stat',
+  'read_dir',
+  'read_output'
+];
+const AGENT_TOOL_NAMES = [
+  ...CHAT_TOOL_NAMES,
+  'edit_file',
+  'insert_text',
+  'replace_range',
+  'copy_file',
+  'apply_patch_preview',
+  'apply_patch',
+  'write_file',
+  'create_dir',
+  'delete_file',
+  'move_file',
+  'run_command'
+];
+const CHAT_TOOL_SCHEMAS = buildToolSchemas(CHAT_TOOL_NAMES);
+const AGENT_TOOL_SCHEMAS = buildToolSchemas(AGENT_TOOL_NAMES);
+
+function buildToolSchemas(toolNames) {
+  return toolNames.map((name) => ({
+    type: 'function',
+    function: {
+      name,
+      description: `${name} tool`,
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: true
+      }
+    }
+  }));
+}
 
 function getToolRunner() {
   if (!toolRunner) {
@@ -483,12 +547,23 @@ async function handleChatMessage(msg) {
     return;
   }
 
-  if (msg.type === 'toggleDebugListen') {
-    debugListenEnabled = Boolean(msg.enabled);
-    if (debugListenEnabled) {
-      await refreshDebugSnapshot();
-    } else {
-      await removeDebugContext();
+    if (msg.type === 'toggleDebugListen') {
+      debugListenEnabled = Boolean(msg.enabled);
+      if (debugListenEnabled) {
+        await refreshDebugSnapshot();
+      } else {
+        await removeDebugContext();
+      }
+      postChatState();
+      return;
+    }
+
+  if (msg.type === 'clearTodos') {
+    chatState.todos = [];
+    todoSeedCache = null;
+    if (activeChatThreadId) {
+      await updateChatThreadTodos(activeChatThreadId, []);
+      await touchChatThread(activeChatThreadId);
     }
     postChatState();
     return;
@@ -889,7 +964,9 @@ async function handleChatMessage(msg) {
         }
         let parsed = parseAgentResponse(assistantText);
         if (!parsed) {
-          parsed = parseTaggedToolCalls(assistantText) || extractToolCallsFromText(assistantText);
+          parsed = parseTaggedToolCalls(assistantText)
+            || extractToolCallsFromText(assistantText)
+            || extractLooseToolCalls(assistantText);
         }
         const todoExtraction = extractTodoFromText(assistantText);
         const extractedTodo = todoExtraction ? todoExtraction.todo : null;
@@ -1334,6 +1411,83 @@ async function removeDebugContext() {
   postChatState();
 }
 
+function isTrivialAgentFinal(text) {
+  const raw = String(text || '').trim().toLowerCase();
+  if (!raw) return true;
+  if (raw === 'all todo items completed.') return true;
+  if (raw === 'stopped.') return true;
+  if (raw.startsWith('error:')) return true;
+  return false;
+}
+
+function trimAgentMemoryText(text) {
+  const limit = getAgentMemoryCharLimit();
+  if (!limit) return '';
+  const raw = String(text || '');
+  if (!raw.trim()) return '';
+  if (raw.length <= limit) return raw.trim();
+  const tail = raw.slice(raw.length - limit);
+  return tail.replace(/^\s+/, '').trimEnd();
+}
+
+function formatAgentMemoryEntry(summary) {
+  const cleaned = String(summary || '').trim();
+  if (!cleaned) return '';
+  const body = cleaned.replace(/^Summary of actions this step:\s*/i, '').trim();
+  const filteredLines = body.split(/\r?\n/).filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    return !(trimmed.startsWith('- read_dir') || trimmed.startsWith('- list_files'));
+  });
+  const filtered = filteredLines.join('\n').trim();
+  if (!filtered) return '';
+  const stamp = new Date().toISOString();
+  return `Actions @ ${stamp}\n${filtered}`;
+}
+
+function formatAgentOutcomeMemory(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed || isTrivialAgentFinal(trimmed)) return '';
+  const compact = trimmed.replace(/\s+/g, ' ').trim();
+  const limit = 600;
+  const excerpt = compact.length > limit ? `${compact.slice(0, limit)}...` : compact;
+  const stamp = new Date().toISOString();
+  return `Outcome @ ${stamp}\n${excerpt}`;
+}
+
+async function appendAgentMemory(entryText) {
+  if (!isAgentMemoryEnabled()) return;
+  const limit = getAgentMemoryCharLimit();
+  if (!limit) return;
+  const entry = String(entryText || '').trim();
+  if (!entry) return;
+  const ok = await ensureChatDbReady();
+  if (!ok || !activeChatThreadId) return;
+  const existing = chatState.contexts.find((ctx) => String(ctx.id) === AGENT_MEMORY_CONTEXT_ID);
+  const existingContent = existing && existing.content ? String(existing.content) : '';
+  if (existingContent && existingContent.trim().endsWith(entry)) {
+    return;
+  }
+  const merged = existingContent ? `${existingContent}\n\n${entry}` : entry;
+  const content = trimAgentMemoryText(merged);
+  const nextEntry = {
+    ...(existing || {}),
+    id: AGENT_MEMORY_CONTEXT_ID,
+    kind: existing && existing.kind ? existing.kind : 'note',
+    title: existing && existing.title ? existing.title : AGENT_MEMORY_TITLE,
+    content
+  };
+  chatState.contexts = existing
+    ? chatState.contexts.map((ctx) => (String(ctx.id) === AGENT_MEMORY_CONTEXT_ID ? nextEntry : ctx))
+    : [...chatState.contexts, nextEntry];
+  if (activeChatThreadId) {
+    await updateChatThreadContext(activeChatThreadId, chatState.contexts);
+    await touchChatThread(activeChatThreadId);
+    await refreshChatThreads();
+  }
+  postChatState();
+}
+
 async function refreshDebugSnapshot() {
   if (!debugListenEnabled) return;
   try {
@@ -1383,6 +1537,7 @@ function buildChatSystemPrompt(context) {
 	'',
     'You can use tools to inspect but not modify the workspace. Respond with JSON only.',
 	'When the user mentions a file name or extension (e.g., about.md), use locate_file and do not call search.',
+	'Do not use any tools that are not listed below. Only the tools listed below are available to you.',
     'Tool schema:',
     '{"toolCalls":[{"tool":"search","args":{"query":"text","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
     '{"toolCalls":[{"tool":"locate_file","args":{"query":"about.md","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
@@ -1433,6 +1588,7 @@ function buildAgentSystemPrompt(context) {
     'Do not include unchanged context lines before/after the range, and do not re-emit entire functions/files for small edits.',
     'Avoid duplicate imports or JSX blocks; when adding an import, insert only the new line.',
     'When the user mentions a file name or extension (e.g., about.md), use locate_file and do not call search.',
+    'Do not use any tools that are not listed below. Only the tools listed below are available to you.',
     'Tool schema:',
     '{"toolCalls":[{"tool":"search","args":{"query":"text","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
     '{"toolCalls":[{"tool":"locate_file","args":{"query":"about.md","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
@@ -1484,15 +1640,16 @@ function parseAgentResponse(text) {
   if (!parsed || typeof parsed !== 'object') return null;
   const todo = Array.isArray(parsed.todo) ? parsed.todo : (Array.isArray(parsed.todos) ? parsed.todos : null);
   const normalizedTodo = todo ? normalizeTodoList(todo) : null;
+  const parsedText = typeof parsed.text === 'string' ? parsed.text : '';
   if (typeof parsed.final === 'string') return { final: parsed.final, todo: normalizedTodo };
   if (typeof parsed.reply === 'string') return { final: parsed.reply, todo: normalizedTodo };
   if (Array.isArray(parsed.toolCalls)) {
-    return { toolCalls: parsed.toolCalls, todo: normalizedTodo };
+    return { toolCalls: parsed.toolCalls, todo: normalizedTodo, text: parsedText };
   }
   if (parsed.tool && typeof parsed.tool === 'string') {
-    return { toolCalls: [{ tool: parsed.tool, args: parsed.args || {} }], todo: normalizedTodo };
+    return { toolCalls: [{ tool: parsed.tool, args: parsed.args || {} }], todo: normalizedTodo, text: parsedText };
   }
-  if (normalizedTodo) return { todo: normalizedTodo };
+  if (normalizedTodo) return { todo: normalizedTodo, text: parsedText };
   return null;
 }
 
@@ -1673,6 +1830,103 @@ function extractToolCallsFromText(text) {
   if (cursor < src.length) remaining += src.slice(cursor);
   const textOut = remaining.trim();
   return { toolCalls, text: textOut };
+}
+
+function extractLooseToolCalls(text) {
+  const src = String(text || '');
+  const toolCalls = [];
+  let cursor = 0;
+
+  while (cursor < src.length) {
+    const toolIdx = src.indexOf('"tool"', cursor);
+    if (toolIdx === -1) break;
+
+    const colonIdx = src.indexOf(':', toolIdx + 6);
+    if (colonIdx === -1) {
+      cursor = toolIdx + 6;
+      continue;
+    }
+    const quoteStart = src.indexOf('"', colonIdx + 1);
+    if (quoteStart === -1) {
+      cursor = colonIdx + 1;
+      continue;
+    }
+    let quoteEnd = quoteStart + 1;
+    while (quoteEnd < src.length) {
+      if (src[quoteEnd] === '"' && src[quoteEnd - 1] !== '\\') break;
+      quoteEnd += 1;
+    }
+    if (quoteEnd >= src.length) {
+      cursor = quoteStart + 1;
+      continue;
+    }
+    const toolName = src.slice(quoteStart + 1, quoteEnd).trim();
+    if (!toolName) {
+      cursor = quoteEnd + 1;
+      continue;
+    }
+
+    const argsKeyIdx = src.indexOf('"args"', quoteEnd);
+    if (argsKeyIdx === -1) {
+      cursor = quoteEnd + 1;
+      continue;
+    }
+    const argsColonIdx = src.indexOf(':', argsKeyIdx + 6);
+    if (argsColonIdx === -1) {
+      cursor = argsKeyIdx + 6;
+      continue;
+    }
+    const braceStart = src.indexOf('{', argsColonIdx);
+    if (braceStart === -1) {
+      cursor = argsColonIdx + 1;
+      continue;
+    }
+
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let braceEnd = -1;
+    for (let i = braceStart; i < src.length; i += 1) {
+      const ch = src[i];
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (ch === '\\\\') {
+          escape = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === '{') {
+        depth += 1;
+        continue;
+      }
+      if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          braceEnd = i;
+          break;
+        }
+      }
+    }
+    if (braceEnd === -1) {
+      cursor = braceStart + 1;
+      continue;
+    }
+
+    const argsText = src.slice(braceStart, braceEnd + 1);
+    const args = safeJsonParse(argsText) || safeJsonParse(extractFirstJsonPayload(argsText)) || {};
+    toolCalls.push({ tool: toolName, args });
+    cursor = braceEnd + 1;
+  }
+
+  if (!toolCalls.length) return null;
+  return { toolCalls, text: '' };
 }
 
 function normalizeTodoItem(item, index) {
@@ -2182,6 +2436,196 @@ function describeToolCall(call) {
   return `Tool call: ${call.tool}`;
 }
 
+function summarizeToolArgs(tool, args) {
+  const safe = args && typeof args === 'object' ? args : {};
+  if (tool === 'search') return String(safe.query || '').trim();
+  if (tool === 'locate_file') return String(safe.query || safe.name || '').trim();
+  if (tool === 'read_file') {
+    const pathText = String(safe.path || '').trim();
+    const start = Number.isFinite(Number(safe.startLine)) ? Number(safe.startLine) : '';
+    const end = Number.isFinite(Number(safe.endLine)) ? Number(safe.endLine) : '';
+    const range = start && end ? ` lines ${start}-${end}` : '';
+    return `${pathText}${range}`.trim();
+  }
+  if (tool === 'read_files') {
+    const paths = Array.isArray(safe.paths) ? safe.paths : [];
+    return paths.join(', ');
+  }
+  if (tool === 'read_file_range_by_symbols') {
+    const pathText = String(safe.path || '').trim();
+    const symbols = Array.isArray(safe.symbols) ? safe.symbols.join(', ') : String(safe.symbols || '').trim();
+    return `${pathText}${symbols ? ` (${symbols})` : ''}`.trim();
+  }
+  if (tool === 'search_symbols' || tool === 'workspace_symbols') {
+    return String(safe.query || '').trim();
+  }
+  if (tool === 'document_symbols') {
+    return String(safe.uri || safe.path || '').trim();
+  }
+  if (tool === 'definition'
+      || tool === 'type_definition'
+      || tool === 'implementation'
+      || tool === 'references'
+      || tool === 'hover'
+      || tool === 'signature_help'
+      || tool === 'call_hierarchy_prepare'
+      || tool === 'rename_prepare'
+      || tool === 'rename_apply'
+      || tool === 'semantic_tokens') {
+    const uri = String(safe.uri || safe.path || '').trim();
+    const line = Number.isFinite(Number(safe.line)) ? Number(safe.line) : '';
+    const character = Number.isFinite(Number(safe.character)) ? Number(safe.character) : '';
+    const pos = line && character ? ` @ ${line}:${character}` : '';
+    const suffix = tool === 'rename_apply' && safe.newName ? ` -> ${String(safe.newName).trim()}` : '';
+    return `${uri}${pos}${suffix}`.trim();
+  }
+  if (tool === 'call_hierarchy_incoming' || tool === 'call_hierarchy_outgoing') {
+    return String(safe.itemId || safe.id || '').trim();
+  }
+  if (tool === 'list_files') {
+    const include = safe.include ? `include=${safe.include}` : '';
+    const exclude = safe.exclude ? `exclude=${safe.exclude}` : '';
+    return [include, exclude].filter(Boolean).join(' ');
+  }
+  if (tool === 'file_stat') return String(safe.path || '').trim();
+  if (tool === 'read_dir') {
+    const pathText = String(safe.path || '').trim();
+    const depth = Number.isFinite(Number(safe.maxDepth)) ? `depth=${Number(safe.maxDepth)}` : '';
+    return [pathText, depth].filter(Boolean).join(' ');
+  }
+  if (tool === 'read_output') {
+    const maxChars = Number.isFinite(Number(safe.maxChars)) ? `maxChars=${Number(safe.maxChars)}` : '';
+    const tail = safe.tail === false ? 'tail=false' : '';
+    return [maxChars, tail].filter(Boolean).join(' ');
+  }
+  if (tool === 'run_command') {
+    const cmd = String(safe.command || '').trim();
+    const cwd = String(safe.cwd || '').trim();
+    return cwd ? `${cmd} (cwd: ${cwd})` : cmd;
+  }
+  if (tool === 'edit_file') {
+    const pathText = String(safe.path || '').trim();
+    const start = Number.isFinite(Number(safe.startLine)) ? Number(safe.startLine) : '';
+    const end = Number.isFinite(Number(safe.endLine)) ? Number(safe.endLine) : '';
+    const range = start && end ? ` lines ${start}-${end}` : '';
+    return `${pathText}${range}`.trim();
+  }
+  if (tool === 'insert_text') {
+    const pathText = String(safe.path || '').trim();
+    const line = Number.isFinite(Number(safe.line)) ? Number(safe.line) : Number(safe.position && safe.position.line);
+    const character = Number.isFinite(Number(safe.character)) ? Number(safe.character) : Number(safe.position && safe.position.character);
+    const pos = Number.isFinite(line) && Number.isFinite(character) ? ` @ ${line}:${character}` : '';
+    return `${pathText}${pos}`.trim();
+  }
+  if (tool === 'replace_range') return String(safe.path || '').trim();
+  if (tool === 'copy_file') {
+    const from = String(safe.from || '').trim();
+    const to = String(safe.to || '').trim();
+    return `${from} -> ${to}`.trim();
+  }
+  if (tool === 'apply_patch' || tool === 'apply_patch_preview') {
+    const patch = String(safe.patch || safe.diff || '');
+    return patch ? `${patch.length} chars` : '';
+  }
+  if (tool === 'write_file') return String(safe.path || '').trim();
+  if (tool === 'create_dir') return String(safe.path || '').trim();
+  if (tool === 'delete_file') return String(safe.path || '').trim();
+  if (tool === 'move_file') {
+    const from = String(safe.from || '').trim();
+    const to = String(safe.to || '').trim();
+    return `${from} -> ${to}`.trim();
+  }
+  const raw = Object.keys(safe).length ? JSON.stringify(safe) : '';
+  if (!raw) return '';
+  return raw.length > 160 ? `${raw.slice(0, 160)}...` : raw;
+}
+
+function isToolResultSuccess(resultText) {
+  const raw = String(resultText || '').trim().toLowerCase();
+  if (!raw) return true;
+  const failurePrefixes = [
+    'tool failed:',
+    'unknown tool:',
+    'invalid tool call',
+    'run failed:',
+    'command failed',
+    'command canceled',
+    'copy canceled',
+    'copy failed:',
+    'move failed:',
+    'delete failed:',
+    'write failed:',
+    'create dir failed:',
+    'edit failed:',
+    'insert text failed:',
+    'replace range failed:',
+    'read failed:',
+    'read files failed:',
+    'read by symbols failed:',
+    'list failed:',
+    'file stat failed:',
+    'read dir failed:',
+    'read output failed:',
+    'apply patch failed:',
+    'apply patch preview failed:',
+    'patch check: failed',
+    'git apply failed:',
+    'patch failed:',
+    'search failed:',
+    'search symbols failed:',
+    'document symbols failed:',
+    'definition failed:',
+    'type definition failed:',
+    'implementation failed:',
+    'references failed:',
+    'hover failed:',
+    'signature help failed:',
+    'call hierarchy prepare failed:',
+    'call hierarchy incoming failed:',
+    'call hierarchy outgoing failed:',
+    'rename prepare failed:',
+    'rename apply failed:',
+    'semantic tokens failed:',
+    'locate file failed:',
+    'revert failed:'
+  ];
+  for (const prefix of failurePrefixes) {
+    if (raw.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
+function buildToolBatchSummary(calls) {
+  if (!Array.isArray(calls) || !calls.length) return '';
+  const grouped = new Map();
+  const order = [];
+  for (const call of calls) {
+    if (!call || typeof call.tool !== 'string') continue;
+    const tool = call.tool;
+    if (!grouped.has(tool)) {
+      grouped.set(tool, []);
+      order.push(tool);
+    }
+    const detail = summarizeToolArgs(tool, call.args);
+    if (detail) grouped.get(tool).push(detail);
+  }
+  if (!order.length) return '';
+
+  const lines = ['Summary of actions this step:'];
+  for (const tool of order) {
+    const entries = grouped.get(tool) || [];
+    const count = entries.length || 1;
+    if (!entries.length) {
+      lines.push(`- ${tool} (${count})`);
+      continue;
+    }
+    const shown = entries.slice(0, 4).join(', ');
+    const suffix = entries.length > 4 ? ` (+${entries.length - 4} more)` : '';
+    lines.push(`- ${tool} (${entries.length}): ${shown}${suffix}`);
+  }
+  return lines.join('\n');
+}
+
 function formatToolResultForUi(tool, resultText) {
   const label = tool ? `Tool result (${tool}):` : 'Tool result:';
   const body = String(resultText || '').trim();
@@ -2208,6 +2652,11 @@ function isLikelyFileQuery(query) {
 function normalizeToolCall(call) {
   if (!call || typeof call.tool !== 'string') return call;
   const args = call.args && typeof call.args === 'object' ? { ...call.args } : {};
+  const toolName = String(call.tool || '');
+  if (toolName.startsWith('container.')) {
+    const mapped = normalizeContainerToolCall(toolName, args);
+    if (mapped) return mapped;
+  }
   if (call.tool === 'search') {
     const query = String(args.query || '').trim();
     if (isLikelyFileQuery(query)) {
@@ -2215,6 +2664,68 @@ function normalizeToolCall(call) {
     }
   }
   return { tool: call.tool, args };
+}
+
+function normalizeContainerToolCall(toolName, args) {
+  const raw = String(toolName || '');
+  const suffix = raw.startsWith('container.') ? raw.slice('container.'.length) : raw;
+  if (suffix === 'exec' || suffix === 'exe' || suffix === 'run') {
+    const cmd = args.cmd != null ? args.cmd : args.command;
+    let command = '';
+    if (Array.isArray(cmd)) {
+      if (cmd.length >= 3 && cmd[0] === 'bash' && cmd[1] === '-lc') {
+        command = cmd.slice(2).join(' ').trim();
+      } else {
+        command = cmd.join(' ').trim();
+      }
+    } else if (typeof cmd === 'string') {
+      command = cmd.trim();
+    }
+    const cwd = typeof args.cwd === 'string' ? args.cwd : (typeof args.workdir === 'string' ? args.workdir : '');
+    return { tool: 'run_command', args: { command, cwd } };
+  }
+
+  const passthrough = new Set([
+    'search',
+    'read_file',
+    'read_files',
+    'read_file_range_by_symbols',
+    'edit_file',
+    'insert_text',
+    'replace_range',
+    'search_symbols',
+    'workspace_symbols',
+    'document_symbols',
+    'definition',
+    'type_definition',
+    'implementation',
+    'references',
+    'hover',
+    'signature_help',
+    'call_hierarchy_prepare',
+    'call_hierarchy_incoming',
+    'call_hierarchy_outgoing',
+    'rename_prepare',
+    'rename_apply',
+    'semantic_tokens',
+    'locate_file',
+    'list_files',
+    'file_stat',
+    'write_file',
+    'create_dir',
+    'delete_file',
+    'move_file',
+    'read_dir',
+    'read_output',
+    'apply_patch_preview',
+    'copy_file',
+    'apply_patch',
+    'run_command'
+  ]);
+  if (passthrough.has(suffix)) {
+    return { tool: suffix, args };
+  }
+  return null;
 }
 
 function isContinuationRequest(text) {
@@ -2273,6 +2784,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
   let lastCommandSignature = null;
   let sawMutationSinceCommand = false;
   let mutationSinceProblems = false;
+  let lastSuccessfulSummary = '';
 
   for (let step = 0; step < maxSteps; step++) {
     if (stopRequested) {
@@ -2308,7 +2820,9 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
     }
     let parsed = parseAgentResponse(assistantText);
     if (!parsed) {
-      parsed = parseTaggedToolCalls(assistantText) || extractToolCallsFromText(assistantText);
+      parsed = parseTaggedToolCalls(assistantText)
+        || extractToolCallsFromText(assistantText)
+        || extractLooseToolCalls(assistantText);
     }
     const todoExtraction = extractTodoFromText(assistantText);
     if (!parsed && todoExtraction && todoExtraction.todo) {
@@ -2323,6 +2837,9 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
     if (!parsed) {
       setAgentContinuation(null);
       uiMessages.push({ role: 'assistant', content: assistantText });
+      if (lastSuccessfulSummary && uiMessages[uiMessages.length - 1].content !== lastSuccessfulSummary) {
+        uiMessages.push({ role: 'assistant', content: lastSuccessfulSummary });
+      }
       chatState.messages = uiMessages;
       return;
     }
@@ -2349,6 +2866,10 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
           continue;
         }
       }
+      const outcomeMemory = formatAgentOutcomeMemory(parsed.final);
+      if (outcomeMemory) {
+        await appendAgentMemory(outcomeMemory);
+      }
       setAgentContinuation(null);
       uiMessages.push({ role: 'assistant', content: parsed.final });
       chatState.messages = uiMessages;
@@ -2370,6 +2891,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       }
       let didMutate = false;
       let didVerify = false;
+      const executedCalls = [];
       for (const call of parsed.toolCalls) {
         const normalizedCall = normalizeToolCall(call);
         uiMessages.push({ role: 'assistant', content: describeToolCall(normalizedCall) });
@@ -2404,6 +2926,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
             continue;
           }
           const result = await runToolCall(normalizedCall);
+          if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
           lastCommandSignature = signature;
           sawMutationSinceCommand = false;
           const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
@@ -2416,6 +2939,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
         }
 
         const result = await runToolCall(normalizedCall);
+        if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
         const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
         uiMessages.push({ role: 'assistant', content: resultText });
         modelMessages.push({ role: 'user', content: resultText });
@@ -2431,12 +2955,16 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
 
       if (didMutate && !didVerify) {
         const runner = getToolRunner();
-        const tree = await runner.toolReadDir({ path: '.', maxDepth: 3, maxEntries: 400 });
+        const readDirCall = { tool: 'read_dir', args: { path: '.', maxDepth: 3, maxEntries: 400 } };
+        const tree = await runner.toolReadDir(readDirCall.args);
+        if (isToolResultSuccess(tree)) executedCalls.push(readDirCall);
         const treeText = formatToolResultForUi('read_dir', limitToolOutput(tree, 12000));
         uiMessages.push({ role: 'assistant', content: treeText });
         modelMessages.push({ role: 'user', content: treeText });
 
-        const files = await runner.toolListFiles({ include: '**/*', exclude: '**/node_modules/**', maxResults: 200 });
+        const listFilesCall = { tool: 'list_files', args: { include: '**/*', exclude: '**/node_modules/**', maxResults: 200 } };
+        const files = await runner.toolListFiles(listFilesCall.args);
+        if (isToolResultSuccess(files)) executedCalls.push(listFilesCall);
         const filesText = formatToolResultForUi('list_files', limitToolOutput(files, 12000));
         uiMessages.push({ role: 'assistant', content: filesText });
         modelMessages.push({ role: 'user', content: filesText });
@@ -2444,6 +2972,17 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
         modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
         chatState.messages = uiMessages;
         postChatState();
+      }
+
+      const summary = buildToolBatchSummary(executedCalls);
+      if (summary) {
+        uiMessages.push({ role: 'assistant', content: summary });
+        modelMessages.push({ role: 'assistant', content: summary });
+        modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
+        chatState.messages = uiMessages;
+        postChatState();
+        lastSuccessfulSummary = summary;
+        await appendAgentMemory(formatAgentMemoryEntry(summary));
       }
 
       continue;
@@ -2474,6 +3013,11 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
           postChatState();
           continue;
         }
+      }
+      const outcomeSource = cleanedBody || assistantText;
+      const outcomeMemory = formatAgentOutcomeMemory(outcomeSource);
+      if (outcomeMemory) {
+        await appendAgentMemory(outcomeMemory);
       }
       setAgentContinuation(null);
       uiMessages.push({ role: 'assistant', content: cleanedBody || assistantText });
@@ -2545,7 +3089,9 @@ async function callModelForChat({ messages, mode, context }) {
   const body = {
     model,
     messages: allMessages,
-    temperature: 0.2
+    temperature: 0.2,
+    tools: mode === 'agent' ? AGENT_TOOL_SCHEMAS : CHAT_TOOL_SCHEMAS,
+    tool_choice: 'auto'
   };
 
   if (isDebugEnabled()) {
@@ -2860,9 +3406,33 @@ function getChatHtml(webview) {
       gap: 6px;
       font-size: 12px;
     }
+    .todo-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
     .todo-title {
       font-weight: 600;
       color: var(--fg);
+    }
+    .todo-close {
+      border: none;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .todo-close:hover {
+      color: var(--fg);
+      background: rgba(255, 255, 255, 0.16);
     }
     .todo-item {
       display: flex;
@@ -3021,6 +3591,37 @@ function getChatHtml(webview) {
     }
     .msg.assistant a:hover {
       text-decoration: underline;
+    }
+    .msg.assistant table.md-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin: 0 0 8px;
+      font-size: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: rgba(0, 0, 0, 0.2);
+    }
+    .msg.assistant table.md-table th,
+    .msg.assistant table.md-table td {
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+      border-right: 1px solid var(--border);
+    }
+    .msg.assistant table.md-table th:last-child,
+    .msg.assistant table.md-table td:last-child {
+      border-right: none;
+    }
+    .msg.assistant table.md-table tr:last-child td {
+      border-bottom: none;
+    }
+    .msg.assistant table.md-table thead th {
+      font-weight: 600;
+      color: var(--fg);
+      background: rgba(0, 0, 0, 0.28);
     }
     .composer {
       border-top: 1px solid var(--border);
@@ -3287,6 +3888,19 @@ function getChatHtml(webview) {
       font-weight: 600;
       font-size: 12px;
       list-style: none;
+    }
+    .tool-summary-title {
+      display: block;
+    }
+    .tool-summary-meta {
+      display: block;
+      font-weight: 400;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .tool-block summary::-webkit-details-marker {
       display: none;

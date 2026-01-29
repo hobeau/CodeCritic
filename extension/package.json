@@ -2,7 +2,7 @@
   "name": "code-critic-notes",
   "displayName": "Code Critic Notes",
   "description": "Review active file or selection with Code Critic (Ollama) and post line-level suggestions into the VS Code Comments panel. Includes one-click AI fix from comment threads.",
-  "version": "0.2.64",
+  "version": "0.2.72",
   "publisher": "local",
   "license": "MIT",
   "dependencies": {
@@ -204,6 +204,16 @@
           "type": "number",
           "default": 6,
           "description": "Maximum number of tool steps the agent can take before stopping."
+        },
+        "codeCritic.agentMemoryEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Maintain a running agent memory/summary in the chat context."
+        },
+        "codeCritic.agentMemoryChars": {
+          "type": "number",
+          "default": 6000,
+          "description": "Max characters to retain in the agent memory/summary context."
         },
         "codeCritic.instructionsFile": {
           "type": "string",

@@ -26,6 +26,25 @@ function extractAssistantText(json) {
   const choices = Array.isArray(json.choices) ? json.choices : [];
   if (!choices.length) return '';
   const message = choices[0] && choices[0].message ? choices[0].message : null;
+  if (message && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+    const toolCalls = [];
+    for (const call of message.tool_calls) {
+      const fn = call && call.function ? call.function : {};
+      const name = fn && fn.name ? fn.name : (call && call.name ? call.name : '');
+      if (!name) continue;
+      const rawArgs = fn && fn.arguments != null ? fn.arguments : (call && call.arguments != null ? call.arguments : '');
+      let args = {};
+      if (rawArgs && typeof rawArgs === 'object') {
+        args = rawArgs;
+      } else if (rawArgs && typeof rawArgs === 'string') {
+        args = safeJsonParse(rawArgs) || safeJsonParse(extractFirstJsonPayload(rawArgs)) || {};
+      }
+      toolCalls.push({ tool: name, args });
+    }
+    if (toolCalls.length) {
+      return JSON.stringify({ toolCalls, text: typeof message.content === 'string' ? message.content : '' });
+    }
+  }
   if (message && typeof message.content === 'string') return message.content;
   if (choices[0] && typeof choices[0].text === 'string') return choices[0].text;
   if (json.message && typeof json.message.content === 'string') return json.message.content;

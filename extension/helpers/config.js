@@ -32,6 +32,18 @@ function getAgentMaxSteps() {
   return Math.max(1, Math.min(50, Math.floor(raw)));
 }
 
+function isAgentMemoryEnabled() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  return Boolean(cfg.get('agentMemoryEnabled', true));
+}
+
+function getAgentMemoryCharLimit() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  const raw = Number(cfg.get('agentMemoryChars', 6000));
+  if (!Number.isFinite(raw)) return 6000;
+  return Math.max(0, Math.floor(raw));
+}
+
 function getAdoConfig() {
   const cfg = vscode.workspace.getConfiguration('codeCritic');
   return {
@@ -49,5 +61,7 @@ module.exports = {
   getMethodReviewConfig,
   getChatHistoryCharLimit,
   getAgentMaxSteps,
+  isAgentMemoryEnabled,
+  getAgentMemoryCharLimit,
   getAdoConfig
 };

@@ -340,25 +340,62 @@ function wrapCodeLines(html) {
   }).join('\n');
 }
 
-function looksNumbered(code) {
+function stripLineNumberPrefix(code) {
   const lines = String(code || '').split('\n');
-  if (!lines.length) return false;
+  if (!lines.length) return { text: String(code || ''), stripped: false };
   let matches = 0;
-  for (const line of lines) {
-    if (/^\s*\d+\s\|\s?/.test(line)) matches += 1;
-  }
-  return matches >= Math.min(3, Math.ceil(lines.length * 0.6));
+  const strippedLines = lines.map((line) => {
+    if (/^\s*\d+\s\|\s?/.test(line)) {
+      matches += 1;
+      return line.replace(/^\s*\d+\s\|\s?/, '');
+    }
+    return line;
+  });
+  const isNumbered = matches >= Math.min(3, Math.ceil(lines.length * 0.6));
+  if (!isNumbered) return { text: String(code || ''), stripped: false };
+  return { text: strippedLines.join('\n'), stripped: true };
 }
 
 function buildCodeBlockHtml(code, lang) {
-  const highlighted = highlightCode(code);
-  if (looksNumbered(code)) {
-    const klass = lang ? ' class="language-' + escapeHtml(lang) + '"' : '';
-    return '<pre><code' + klass + '>' + highlighted + '</code></pre>';
-  }
+  const normalized = stripLineNumberPrefix(code);
+  const highlighted = highlightCode(normalized.text);
   const withLines = wrapCodeLines(highlighted);
   const klass = lang ? ' class="code-block language-' + escapeHtml(lang) + '"' : ' class="code-block"';
   return '<pre><code' + klass + '>' + withLines + '</code></pre>';
+}
+
+function isTableSeparator(line) {
+  const trimmed = String(line || '').trim();
+  if (!trimmed || !trimmed.includes('|')) return false;
+  return /^(\|?\s*:?-{2,}:?\s*)+\|?$/.test(trimmed);
+}
+
+function isTableRow(line) {
+  const trimmed = String(line || '').trim();
+  return Boolean(trimmed) && trimmed.includes('|');
+}
+
+function splitTableRow(line) {
+  let trimmed = String(line || '').trim();
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1);
+  return trimmed.split('|').map((cell) => cell.trim());
+}
+
+function buildTableHtml(lines) {
+  if (!lines.length) return '';
+  const headerCells = splitTableRow(lines[0]).map((cell) => escapeHtml(cell || ''));
+  const bodyRows = [];
+  for (let i = 2; i < lines.length; i += 1) {
+    const cells = splitTableRow(lines[i]).map((cell) => escapeHtml(cell || ''));
+    if (!cells.length) continue;
+    bodyRows.push(cells);
+  }
+  const thead = '<thead><tr>' + headerCells.map((cell) => `<th>${cell}</th>`).join('') + '</tr></thead>';
+  const tbody = bodyRows.length
+    ? '<tbody>' + bodyRows.map((row) => '<tr>' + row.map((cell) => `<td>${cell}</td>`).join('') + '</tr>').join('') + '</tbody>'
+    : '<tbody></tbody>';
+  return `<table class="md-table">${thead}${tbody}</table>`;
 }
 
 function renderMarkdown(text) {
@@ -376,6 +413,28 @@ function renderMarkdown(text) {
     blocks.push(html);
     return '@@BLOCK' + (blocks.length - 1) + '@@';
   });
+
+  const tableLines = src.split('\n');
+  const processed = [];
+  for (let i = 0; i < tableLines.length; i += 1) {
+    const line = tableLines[i];
+    const nextLine = tableLines[i + 1];
+    if (isTableRow(line) && isTableSeparator(nextLine)) {
+      const blockLines = [line, nextLine];
+      let j = i + 2;
+      while (j < tableLines.length && isTableRow(tableLines[j])) {
+        blockLines.push(tableLines[j]);
+        j += 1;
+      }
+      const html = buildTableHtml(blockLines);
+      blocks.push(html);
+      processed.push('@@BLOCK' + (blocks.length - 1) + '@@');
+      i = j - 1;
+      continue;
+    }
+    processed.push(line);
+  }
+  src = processed.join('\n');
 
   src = escapeHtml(src);
 
@@ -682,10 +741,19 @@ function renderTodos() {
   if (!todos.length) return;
   const card = document.createElement('div');
   card.className = 'todo-card';
+  const header = document.createElement('div');
+  header.className = 'todo-header';
   const title = document.createElement('div');
   title.className = 'todo-title';
   title.textContent = 'Plan';
-  card.appendChild(title);
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'todo-close';
+  closeBtn.type = 'button';
+  closeBtn.textContent = '×';
+  closeBtn.title = 'Clear plan';
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+  card.appendChild(header);
 
   for (const item of todos) {
     const row = document.createElement('div');
@@ -732,7 +800,20 @@ function buildToolBlock(contents) {
   const details = document.createElement('details');
   details.className = 'tool-block';
   const summary = document.createElement('summary');
-  summary.textContent = summaryText || 'Tool';
+  const summaryTitle = document.createElement('span');
+  summaryTitle.className = 'tool-summary-title';
+  summaryTitle.textContent = summaryText || 'Tool';
+  summary.appendChild(summaryTitle);
+  if (summaryText.startsWith('Tool call: run_command')) {
+    const cmdMatch = /- command:\s*`([^`]+)`/m.exec(text);
+    const cmd = cmdMatch ? cmdMatch[1] : '';
+    if (cmd) {
+      const summaryMeta = document.createElement('div');
+      summaryMeta.className = 'tool-summary-meta';
+      summaryMeta.textContent = cmd;
+      summary.appendChild(summaryMeta);
+    }
+  }
   const body = document.createElement('div');
   body.className = 'tool-body';
   if (meta.revertId) {
@@ -953,6 +1034,13 @@ window.addEventListener('message', (event) => {
 document.addEventListener('click', (event) => {
   const target = event.target;
   if (!target) return;
+  const todoClose = target.closest('button.todo-close');
+  if (todoClose) {
+    if (!postVsCodeMessage({ type: 'clearTodos' })) {
+      if (statusEl) statusEl.textContent = 'Unable to clear plan';
+    }
+    return;
+  }
   const revertBtn = target.closest('button.tool-revert');
   if (revertBtn) {
     const id = revertBtn.dataset.revertId;
