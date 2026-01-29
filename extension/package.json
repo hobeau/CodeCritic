@@ -2,7 +2,7 @@
   "name": "code-critic-notes",
   "displayName": "Code Critic Notes",
   "description": "Review active file or selection with Code Critic (Ollama) and post line-level suggestions into the VS Code Comments panel. Includes one-click AI fix from comment threads.",
-  "version": "0.2.72",
+  "version": "0.2.89",
   "publisher": "local",
   "license": "MIT",
   "dependencies": {
@@ -26,6 +26,7 @@
     "onCommand:codeCritic.openChat",
     "onCommand:codeCritic.chatWithSelection",
     "onCommand:codeCritic.clear",
+    "onCommand:codeCritic.showAiSugar",
     "onCommand:codeCritic.generateProposedChange",
     "onCommand:codeCritic.applyProposedChange",
     "onCommand:codeCritic.regenerateProposedChange",
@@ -74,6 +75,10 @@
       {
         "command": "codeCritic.clear",
         "title": "CodeCritic: Clear Review Comments"
+      },
+      {
+        "command": "codeCritic.showAiSugar",
+        "title": "CodeCritic: Show AI Sugar"
       },
       {
         "command": "codeCritic.discardThread",

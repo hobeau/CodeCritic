@@ -16,18 +16,23 @@ const {
   getAgentMemoryCharLimit
 } = require('../helpers/config');
 const { getOutputChannel, updateTokenEstimate } = require('../helpers/output');
-const { buildMethodDependencyContext, updateSelectionContextsForEdit } = require('../helpers/context');
+const { buildMethodDependencyContext, updateSelectionContextsForEdit, buildChatContextBlock, normalizeContextList, normalizeContextEntry, buildContextId } = require('../helpers/context');
 const { getWorkspaceRoot, resolveWorkspacePathForTool, toWorkspaceRelativePath } = require('../helpers/workspace');
 const { safeJsonParse, extractFirstJsonPayload, extractAssistantText, postChatCompletions } = require('../helpers/llm');
 const { createToolRunner, limitToolOutput } = require('../tools/agentTools');
+const { updateAiSugarState } = require('./aiSugar');
+const { buildSystemPrompt, CHAT_TOOL_NAMES, AGENT_TOOL_NAMES } = require('../helpers/prompts');
+
 
 /** @type {vscode.ExtensionContext | undefined} */
 let extensionContext;
 /** @type {vscode.WebviewView | undefined} */
 let chatView;
 let chatViewInitialized = false;
-/** @type {{ mode: 'chat'|'agent', contexts: any[], messages: Array<{ role: 'user'|'assistant', content: string }>, todos: any[], approvals: any[], model?: string }} */
-let chatState = { mode: 'chat', contexts: [], messages: [], todos: [], approvals: [], model: '' };
+/** @type {vscode.WebviewPanel | undefined} */
+let htmlPreviewPanel;
+/** @type {{ mode: 'chat'|'planner'|'agent', contexts: any[], messages: Array<{ role: 'user'|'assistant', content: string }>, todos: any[], plan: any[], approvals: any[], model?: string }} */
+let chatState = { mode: 'chat', contexts: [], messages: [], todos: [], plan: [], approvals: [], model: '' };
 let chatBusy = false;
 /** @type {import('sqlite3').Database | undefined} */
 let chatDb;
@@ -53,12 +58,14 @@ const DEBUG_CONTEXT_ID = 'debug_snapshot_live';
 const AGENT_MEMORY_CONTEXT_ID = 'agent_memory_summary';
 const AGENT_MEMORY_TITLE = 'Agent Memory';
 let chatModelOptions = [];
-const CHAT_TOOL_NAMES = [
-  'search',
-  'locate_file',
-  'search_symbols',
-  'workspace_symbols',
-  'document_symbols',
+const TOOL_MESSAGE_MAX = 40;
+const TOOL_READ = new Set([
+  'read_file',
+  'read_files',
+  'read_file_range_by_symbols',
+  'read_dir',
+  'read_output',
+  'file_stat',
   'definition',
   'type_definition',
   'implementation',
@@ -68,45 +75,130 @@ const CHAT_TOOL_NAMES = [
   'call_hierarchy_prepare',
   'call_hierarchy_incoming',
   'call_hierarchy_outgoing',
-  'semantic_tokens',
-  'read_file',
-  'read_files',
-  'read_file_range_by_symbols',
-  'list_files',
-  'file_stat',
-  'read_dir',
-  'read_output'
-];
-const AGENT_TOOL_NAMES = [
-  ...CHAT_TOOL_NAMES,
+  'semantic_tokens'
+]);
+const TOOL_WRITE = new Set([
   'edit_file',
   'insert_text',
   'replace_range',
-  'copy_file',
-  'apply_patch_preview',
-  'apply_patch',
   'write_file',
   'create_dir',
   'delete_file',
   'move_file',
-  'run_command'
-];
-const CHAT_TOOL_SCHEMAS = buildToolSchemas(CHAT_TOOL_NAMES);
-const AGENT_TOOL_SCHEMAS = buildToolSchemas(AGENT_TOOL_NAMES);
+  'copy_file',
+  'apply_patch',
+  'apply_patch_preview'
+]);
+const TOOL_SEARCH = new Set([
+  'search',
+  'locate_file',
+  'search_symbols',
+  'workspace_symbols',
+  'document_symbols',
+  'list_files'
+]);
+const TOOL_RUN = new Set(['run_command']);
 
-function buildToolSchemas(toolNames) {
-  return toolNames.map((name) => ({
-    type: 'function',
-    function: {
-      name,
-      description: `${name} tool`,
-      parameters: {
-        type: 'object',
-        properties: {},
-        additionalProperties: true
-      }
+function truncateText(value, maxLen) {
+  const raw = String(value || '');
+  const limit = Math.max(0, Number(maxLen || TOOL_MESSAGE_MAX));
+  if (!raw || raw.length <= limit) return raw;
+  if (limit <= 3) return raw.slice(0, limit);
+  return raw.slice(0, limit - 3) + '...';
+}
+
+function basenameFromPath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const normalized = raw.replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || normalized;
+}
+
+function normalizePatchPath(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed || trimmed === '/dev/null') return '';
+  const unquoted = trimmed.replace(/^"+|"+$/g, '');
+  return unquoted.replace(/^[ab]\//, '');
+}
+
+function extractFirstPatchPath(patch) {
+  const lines = String(patch || '').split(/\r?\n/);
+  let pendingOld = '';
+  for (const line of lines) {
+    if (line.startsWith('--- ')) {
+      pendingOld = normalizePatchPath(line.slice(4));
+      continue;
     }
-  }));
+    if (line.startsWith('+++ ')) {
+      const nextPath = normalizePatchPath(line.slice(4));
+      return nextPath || pendingOld;
+    }
+  }
+  return pendingOld;
+}
+
+function getToolFileLabel(tool, args) {
+  const safe = args && typeof args === 'object' ? args : {};
+  if (tool === 'read_files') {
+    const paths = Array.isArray(safe.paths) ? safe.paths.filter(Boolean) : [safe.paths].filter(Boolean);
+    const first = paths[0];
+    const suffix = paths.length > 1 ? ` (+${paths.length - 1})` : '';
+    const base = basenameFromPath(first);
+    return base ? `${base}${suffix}` : '';
+  }
+  if (tool === 'copy_file' || tool === 'move_file') {
+    return basenameFromPath(safe.to || safe.from);
+  }
+  if (tool === 'apply_patch' || tool === 'apply_patch_preview') {
+    return basenameFromPath(extractFirstPatchPath(safe.patch));
+  }
+  if (tool === 'read_output') {
+    return 'output';
+  }
+  const pathValue = safe.path || safe.uri;
+  return basenameFromPath(pathValue);
+}
+
+function buildToolSugarState(tool, args) {
+  if (!tool || typeof tool !== 'string') return null;
+  if (TOOL_RUN.has(tool)) {
+    const rawCommand = String(args && args.command ? args.command : '').replace(/\s+/g, ' ').trim();
+    const prefix = 'Running: ';
+    const maxCmd = Math.max(0, TOOL_MESSAGE_MAX - prefix.length);
+    const commandText = truncateText(rawCommand || 'command', maxCmd);
+    return { message: truncateText(prefix + commandText, TOOL_MESSAGE_MAX), attractorStrength: 2 };
+  }
+  if (TOOL_WRITE.has(tool)) {
+    const fileLabel = getToolFileLabel(tool, args);
+    const label = fileLabel ? `Writing file: ${fileLabel}` : 'Writing file';
+    return { message: truncateText(label, TOOL_MESSAGE_MAX), attractorStrength: 3 };
+  }
+  if (TOOL_READ.has(tool)) {
+    const fileLabel = getToolFileLabel(tool, args);
+    const label = fileLabel ? `Reading file: ${fileLabel}` : 'Reading file';
+    return { message: truncateText(label, TOOL_MESSAGE_MAX), attractorStrength: 1 };
+  }
+  if (TOOL_SEARCH.has(tool)) {
+    return { message: 'Searching', attractorStrength: 0 };
+  }
+  return null;
+}
+
+async function runToolWithSugar(tool, args, runner) {
+  const sugar = buildToolSugarState(tool, args);
+  if (sugar) {
+    const next = { attractorStrength: sugar.attractorStrength };
+    if (sugar.message) next.toolMessage = sugar.message;
+    updateAiSugarState(next);
+  }
+  try {
+    return await runner();
+  } finally {
+    if (sugar && sugar.attractorStrength) {
+      updateAiSugarState({ attractorStrength: 0 });
+    }
+  }
 }
 
 function getToolRunner() {
@@ -218,7 +310,7 @@ function registerChatFeature({ context, threadState }) {
     vscode.window.registerWebviewViewProvider(
       'codeCritic.chatView',
       {
-        resolveWebviewView(view) {
+        async resolveWebviewView(view) {
           chatView = view;
           chatViewInitialized = true;
 
@@ -229,7 +321,7 @@ function registerChatFeature({ context, threadState }) {
             enableScripts: true,
             localResourceRoots: localRoots
           };
-          view.webview.html = getChatHtml(view.webview);
+          view.webview.html = await getChatHtml(view.webview);
 
           view.webview.onDidReceiveMessage((msg) => {
             void handleChatMessage(msg);
@@ -354,55 +446,6 @@ async function openChatPanel() {
   }
 }
 
-function buildChatContextFromSelection(doc, sel, extraContext) {
-  const cfg = vscode.workspace.getConfiguration('codeCritic');
-  const maxChars = cfg.get('maxChars', 80000);
-  let code = doc.getText(sel);
-  if (code.length > maxChars) {
-    code = code.slice(0, maxChars) + "\n\n/* ...TRUNCATED... */\n";
-    vscode.window.showWarningMessage(`CodeCritic: Truncated selection to ${maxChars.toLocaleString()} chars for chat.`);
-  }
-
-  const wsRoot = getWorkspaceRoot();
-  const rel = wsRoot && doc.uri.fsPath.startsWith(wsRoot)
-    ? path.relative(wsRoot, doc.uri.fsPath).replace(/\\/g, '/')
-    : doc.uri.fsPath;
-
-  return {
-    id: buildContextId(),
-    kind: 'selection',
-    title: `${rel}:${sel.start.line + 1}-${sel.end.line + 1}`,
-    code,
-    languageId: doc.languageId,
-    extraContext: String(extraContext || ''),
-    filePath: rel,
-    selection: { startLine: sel.start.line + 1, endLine: sel.end.line + 1 }
-  };
-}
-
-function buildContextId() {
-  return `ctx_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
-
-function normalizeContextEntry(entry) {
-  if (!entry || typeof entry !== 'object') return null;
-  const normalized = { ...entry };
-  if (!normalized.id) normalized.id = buildContextId();
-  if (!normalized.kind) normalized.kind = normalized.content ? 'note' : 'selection';
-  return normalized;
-}
-
-function normalizeContextList(input) {
-  if (Array.isArray(input)) {
-    return input.map(normalizeContextEntry).filter(Boolean);
-  }
-  if (input && typeof input === 'object') {
-    const normalized = normalizeContextEntry(input);
-    return normalized ? [normalized] : [];
-  }
-  return [];
-}
-
 async function setChatContext(context, options) {
   await ensureChatReady();
   const nextContexts = normalizeContextList(context);
@@ -431,6 +474,7 @@ function buildChatViewState() {
     mode: chatState.mode,
     contexts: chatState.contexts,
     todos: chatState.todos,
+    plan: chatState.plan,
     approvals: chatState.approvals,
     messages: chatState.messages,
     busy: chatBusy,
@@ -517,9 +561,20 @@ async function handleChatMessage(msg) {
   }
 
   if (msg.type === 'setMode') {
-    if (msg.mode === 'chat' || msg.mode === 'agent') {
+    if (msg.mode === 'chat' || msg.mode === 'planner' || msg.mode === 'agent') {
+      const prevMode = chatState.mode;
       chatState.mode = msg.mode;
       setAgentContinuation(null);
+      if (prevMode === 'planner' && msg.mode === 'agent') {
+        const seeded = seedTodosFromPlan(chatState.plan);
+        if (seeded.length) {
+          await setTodoList(seeded);
+          todoSeedCache = seeded;
+        } else {
+          await setTodoList([]);
+          todoSeedCache = null;
+        }
+      }
       postChatState();
     }
     return;
@@ -559,11 +614,19 @@ async function handleChatMessage(msg) {
     }
 
   if (msg.type === 'clearTodos') {
-    chatState.todos = [];
-    todoSeedCache = null;
-    if (activeChatThreadId) {
-      await updateChatThreadTodos(activeChatThreadId, []);
-      await touchChatThread(activeChatThreadId);
+    if (chatState.mode === 'agent') {
+      chatState.todos = [];
+      todoSeedCache = null;
+      if (activeChatThreadId) {
+        await updateChatThreadTodos(activeChatThreadId, []);
+        await touchChatThread(activeChatThreadId);
+      }
+    } else {
+      chatState.plan = [];
+      if (activeChatThreadId) {
+        await updateChatThreadPlan(activeChatThreadId, []);
+        await touchChatThread(activeChatThreadId);
+      }
     }
     postChatState();
     return;
@@ -572,7 +635,7 @@ async function handleChatMessage(msg) {
   if (msg.type === 'newThread') {
     await ensureChatReady();
     setAgentContinuation(null);
-    const newId = await createChatThread({ title: defaultChatTitle(), context: null, todos: [] });
+    const newId = await createChatThread({ title: defaultChatTitle(), context: null, todos: [], plan: [] });
     if (newId) {
       await loadChatThread(newId);
       await persistActiveChatThreadId();
@@ -602,6 +665,44 @@ async function handleChatMessage(msg) {
     } catch (err) {
       vscode.window.showErrorMessage(`CodeCritic: Failed to open file. ${String(err && err.message ? err.message : err)}`);
     }
+    return;
+  }
+
+  if (msg.type === 'previewHtml') {
+    const raw = String(msg.code || '');
+    const trimmed = raw.trim();
+    const isFullDoc = /^\s*<!doctype/i.test(trimmed) || /^\s*<html/i.test(trimmed);
+    const targetColumn = vscode.ViewColumn.Beside;
+    if (!htmlPreviewPanel) {
+      htmlPreviewPanel = vscode.window.createWebviewPanel(
+        'htmlPreview',
+        'HTML Preview',
+        targetColumn,
+        { enableScripts: true, retainContextWhenHidden: true }
+      );
+      htmlPreviewPanel.onDidDispose(() => {
+        htmlPreviewPanel = undefined;
+      });
+    } else {
+      htmlPreviewPanel.reveal(targetColumn, true);
+    }
+    htmlPreviewPanel.webview.html = isFullDoc ? raw : `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTML Preview</title>
+    <style>
+        body {
+            background-color: var(--vscode-editor-background);
+            color: var(--vscode-editor-foreground);
+        }
+    </style>
+</head>
+<body>
+    ${raw}
+</body>
+</html>`;
     return;
   }
 
@@ -774,11 +875,16 @@ async function handleChatMessage(msg) {
       activeChatThreadId = await createChatThread({
         title: defaultChatTitle(),
         context: chatState.contexts,
-        todos: chatState.todos
+        todos: chatState.todos,
+        plan: chatState.plan
       });
       await persistActiveChatThreadId();
     }
     chatBusy = true;
+    let sugarOutcome = 'success';
+    const markSugarFailure = () => { sugarOutcome = 'failure'; };
+    const markSugarStopped = () => { sugarOutcome = null; };
+    updateAiSugarState({ thinking: true, outcome: null });
     postChatState();
 
     try {
@@ -871,7 +977,12 @@ async function handleChatMessage(msg) {
 
         const modelMessages = trimChatMessagesForModel(modelSeed, historyLimit);
         const beforeCount = baseWithTools.length;
-        await runAgentTurn(baseWithTools, modelMessages);
+        const agentStatus = await runAgentTurn(baseWithTools, modelMessages);
+        if (agentStatus === 'failure') {
+          markSugarFailure();
+        } else if (agentStatus === 'stopped') {
+          markSugarStopped();
+        }
         const newMessages = chatState.messages.slice(beforeCount);
         if (threadId) {
           for (const newMsg of newMessages) {
@@ -945,57 +1056,98 @@ async function handleChatMessage(msg) {
             return cloned;
           })()
           : baseWithTools;
-        const modelMessages = trimChatMessagesForModel(modelInput, historyLimit);
-        const assistantText = await callModelForChat({
-          messages: modelMessages,
-          mode: chatState.mode,
-          context: chatState.contexts
-        });
-        const trimmedAssistant = String(assistantText || '').trim();
-        if (!trimmedAssistant) {
-          const content = 'Error: model returned an empty response. Try another model or check the endpoint.';
-          chatState.messages = [...baseWithTools, { role: 'assistant', content }];
-          if (threadId) {
-            await addChatMessage(threadId, 'assistant', content);
-            await touchChatThread(threadId);
-            await refreshChatThreads();
-          }
-          return;
-        }
-        let parsed = parseAgentResponse(assistantText);
-        if (!parsed) {
-          parsed = parseTaggedToolCalls(assistantText)
-            || extractToolCallsFromText(assistantText)
-            || extractLooseToolCalls(assistantText);
-        }
-        const todoExtraction = extractTodoFromText(assistantText);
-        const extractedTodo = todoExtraction ? todoExtraction.todo : null;
-        const displayText = todoExtraction
-          ? stripTodoJsonFromText(assistantText, todoExtraction.range)
-          : assistantText;
-        if (parsed && parsed.toolCalls && parsed.toolCalls.length) {
-          const toolMessages = [];
-          for (const call of parsed.toolCalls) {
-            const normalizedCall = normalizeToolCall(call);
-            const toolLabel = describeToolCall(normalizedCall);
-            toolMessages.push({ role: 'assistant', content: toolLabel });
-            const result = await runToolCall(normalizedCall);
-            const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
-            toolMessages.push({ role: 'assistant', content: resultText });
-          }
-          chatState.messages = [...baseWithTools, ...toolMessages];
-          if (threadId) {
-            for (const toolMsg of toolMessages) {
-              await addChatMessage(threadId, 'assistant', toolMsg.content);
+        const maxSteps = Math.max(3, Math.min(6, getAgentMaxSteps()));
+        let modelTrace = [...modelInput];
+        let uiMessages = [...baseWithTools];
+        for (let step = 0; step < maxSteps; step += 1) {
+          if (stopRequested) {
+            stopRequested = false;
+            chatBusy = false;
+            markSugarStopped();
+            chatState.messages = [...uiMessages, { role: 'assistant', content: 'Stopped.' }];
+            postChatState();
+            if (threadId) {
+              await addChatMessage(threadId, 'assistant', 'Stopped.');
+              await touchChatThread(threadId);
+              await refreshChatThreads();
             }
-            await touchChatThread(threadId);
-            await refreshChatThreads();
+            return;
           }
-        } else {
-          if (parsed && parsed.todo) {
-            await applyTodoUpdate(parsed.todo);
-          } else if (extractedTodo) {
-            await applyTodoUpdate(extractedTodo);
+          const assistantText = await callModelForChat({
+            messages: trimChatMessagesForModel(modelTrace, historyLimit),
+            mode: chatState.mode,
+            context: chatState.contexts
+          });
+          const trimmedAssistant = String(assistantText || '').trim();
+          if (!trimmedAssistant) {
+            markSugarFailure();
+            const content = 'Error: model returned an empty response. Try another model or check the endpoint.';
+            chatState.messages = [...uiMessages, { role: 'assistant', content }];
+            postChatState();
+            if (threadId) {
+              await addChatMessage(threadId, 'assistant', content);
+              await touchChatThread(threadId);
+              await refreshChatThreads();
+            }
+            return;
+          }
+          let parsed = parseAgentResponse(assistantText);
+          if (!parsed) {
+            parsed = parseTaggedToolCalls(assistantText)
+              || extractToolCallsFromText(assistantText)
+              || extractLooseToolCalls(assistantText);
+          }
+          const todoExtraction = extractTodoFromText(assistantText);
+          const extractedTodo = todoExtraction ? todoExtraction.todo : null;
+          const displayText = todoExtraction
+            ? stripTodoJsonFromText(assistantText, todoExtraction.range)
+            : assistantText;
+          if (parsed && parsed.toolCalls && parsed.toolCalls.length) {
+            if (parsed.text && parsed.text.trim()) {
+              const leadText = parsed.text.trim();
+              uiMessages.push({ role: 'assistant', content: leadText });
+              chatState.messages = uiMessages;
+              postChatState();
+              if (threadId) {
+                await addChatMessage(threadId, 'assistant', leadText);
+                await touchChatThread(threadId);
+                await refreshChatThreads();
+              }
+            }
+            modelTrace.push({ role: 'assistant', content: assistantText });
+            const toolMessages = [];
+            const modelToolMessages = [];
+            for (const call of parsed.toolCalls) {
+              const normalizedCall = normalizeToolCall(call);
+              const toolLabel = describeToolCall(normalizedCall);
+              toolMessages.push({ role: 'assistant', content: toolLabel });
+              const result = await runToolCall(normalizedCall);
+              const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
+              toolMessages.push({ role: 'assistant', content: resultText });
+              modelToolMessages.push({ role: 'user', content: resultText });
+            }
+            uiMessages = [...uiMessages, ...toolMessages];
+            chatState.messages = uiMessages;
+            postChatState();
+            if (threadId) {
+              for (const toolMsg of toolMessages) {
+                await addChatMessage(threadId, 'assistant', toolMsg.content);
+              }
+              await touchChatThread(threadId);
+              await refreshChatThreads();
+            }
+            modelTrace = trimChatMessagesForModel([...modelTrace, ...modelToolMessages], historyLimit);
+            continue;
+          }
+          if (chatState.mode === 'planner' && parsed && Array.isArray(parsed.plan)) {
+            await applyPlanUpdate(parsed.plan);
+          }
+          if (chatState.mode !== 'planner') {
+            if (parsed && parsed.todo) {
+              await applyTodoUpdate(parsed.todo);
+            } else if (extractedTodo) {
+              await applyTodoUpdate(extractedTodo);
+            }
           }
           const cleanedDisplay = displayText && displayText.trim() ? displayText : '';
           let content = parsed && parsed.final
@@ -1005,28 +1157,43 @@ async function handleChatMessage(msg) {
             ? isBareTodoResponse(parsed, assistantText)
             : (extractedTodo && !cleanedDisplay);
           if (isBareTodo) {
-            chatState.messages = baseWithTools;
+            chatState.messages = uiMessages;
+            postChatState();
             if (threadId) {
               await touchChatThread(threadId);
               await refreshChatThreads();
             }
           } else {
-            chatState.messages = [...baseWithTools, { role: 'assistant', content }];
+            uiMessages = [...uiMessages, { role: 'assistant', content }];
+            chatState.messages = uiMessages;
+            postChatState();
             if (threadId) {
               await addChatMessage(threadId, 'assistant', content);
               await touchChatThread(threadId);
               await refreshChatThreads();
             }
           }
+          return;
+        }
+        markSugarFailure();
+        uiMessages = [...uiMessages, { role: 'assistant', content: 'Chat stopped: too many tool steps.' }];
+        chatState.messages = uiMessages;
+        postChatState();
+        if (threadId) {
+          await addChatMessage(threadId, 'assistant', 'Chat stopped: too many tool steps.');
+          await touchChatThread(threadId);
+          await refreshChatThreads();
         }
       }
     } catch (err) {
       if (stopRequested || (err && err.name === 'AbortError')) {
         stopRequested = false;
         chatBusy = false;
+        markSugarStopped();
         postChatState();
         return;
       }
+      markSugarFailure();
       const out = getOutputChannel();
       out.appendLine(`CodeCritic chat failed: ${String(err && err.message ? err.message : err)}`);
       out.show(true);
@@ -1042,6 +1209,7 @@ async function handleChatMessage(msg) {
       }
     } finally {
       chatBusy = false;
+      updateAiSugarState({ thinking: false, outcome: sugarOutcome });
       postChatState();
     }
   }
@@ -1049,6 +1217,7 @@ async function handleChatMessage(msg) {
   if (msg.type === 'stop') {
     stopRequested = true;
     setAgentContinuation(null);
+    updateAiSugarState({ thinking: false, outcome: null });
     if (activeAbortController) {
       try { activeAbortController.abort(); } catch { /* ignore */ }
     }
@@ -1364,18 +1533,20 @@ async function buildDebuggerContextMessage(sessionFilter = '') {
 
 async function buildSearchContextMessage(query) {
   const text = String(query || '').trim();
-  const result = await getToolRunner().toolSearch({
+  const searchArgs = {
     query: text,
     include: '**/*',
     exclude: '**/node_modules/**',
     maxResults: 20
-  });
+  };
+  const result = await runToolWithSugar('search', searchArgs, () => getToolRunner().toolSearch(searchArgs));
   return formatToolResultForUi('search', result);
 }
 
 async function buildSymbolsContextMessage(query) {
   const text = String(query || '').trim();
-  const result = await getToolRunner().toolSearchSymbols({ query: text, maxResults: 20 });
+  const symbolsArgs = { query: text, maxResults: 20 };
+  const result = await runToolWithSugar('search_symbols', symbolsArgs, () => getToolRunner().toolSearchSymbols(symbolsArgs));
   return formatToolResultForUi('search_symbols', result);
 }
 
@@ -1500,156 +1671,39 @@ async function refreshDebugSnapshot() {
   }
 }
 
-function buildChatContextBlock(contexts) {
-  const list = normalizeContextList(contexts);
-  if (!list.length) return '';
-  const blocks = [];
-  for (const ctx of list) {
-    const headerParts = [];
-    const title = ctx.title || ctx.filePath || ctx.kind || 'Context';
-    headerParts.push(`Context: ${title}`);
-    if (ctx.filePath) headerParts.push(`File: ${ctx.filePath}`);
-    if (ctx.languageId) headerParts.push(`Language: ${ctx.languageId}`);
-    if (ctx.selection) {
-      headerParts.push(`Selection: lines ${ctx.selection.startLine}-${ctx.selection.endLine}`);
-    }
-    const blockParts = [...headerParts];
-    if (ctx.code && String(ctx.code).trim()) {
-      blockParts.push('Selected code:', String(ctx.code).trim());
-    }
-    if (ctx.extraContext && String(ctx.extraContext).trim()) {
-      blockParts.push('Additional context:', String(ctx.extraContext).trim());
-    }
-    if (ctx.content && String(ctx.content).trim()) {
-      blockParts.push('Notes:', String(ctx.content).trim());
-    }
-    blocks.push(blockParts.join('\n'));
-  }
-  return blocks.join('\n\n');
-}
-
-function buildChatSystemPrompt(context) {
-  const base = [
-    'You are a helpful coding assistant.',
-    'Answer the user clearly and directly.',
-    'Use the provided context when relevant.',
-    'Do not perform a code review unless the user explicitly asks.',
-	'',
-    'You can use tools to inspect but not modify the workspace. Respond with JSON only.',
-	'When the user mentions a file name or extension (e.g., about.md), use locate_file and do not call search.',
-	'Do not use any tools that are not listed below. Only the tools listed below are available to you.',
-    'Tool schema:',
-    '{"toolCalls":[{"tool":"search","args":{"query":"text","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"locate_file","args":{"query":"about.md","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"search_symbols","args":{"query":"SymbolName","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"workspace_symbols","args":{"query":"SymbolName","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"document_symbols","args":{"uri":"src/App.jsx"}}]}',
-    '{"toolCalls":[{"tool":"definition","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"type_definition","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"implementation","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"references","args":{"uri":"src/App.jsx","line":10,"character":5,"includeDeclaration":true}}]}',
-    '{"toolCalls":[{"tool":"hover","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"signature_help","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"call_hierarchy_prepare","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"call_hierarchy_incoming","args":{"itemId":"chi_123"}}]}',
-    '{"toolCalls":[{"tool":"call_hierarchy_outgoing","args":{"itemId":"chi_123"}}]}',
-    '{"toolCalls":[{"tool":"semantic_tokens","args":{"uri":"src/App.jsx","range":{"startLine":1,"startCharacter":1,"endLine":50,"endCharacter":1}}}]}',
-    '{"toolCalls":[{"tool":"read_file","args":{"path":"relative/path","startLine":1,"endLine":200}}]}',
-    '{"toolCalls":[{"tool":"read_files","args":{"paths":["src/App.jsx","src/main.jsx"],"ranges":[{"startLine":1,"endLine":200},{"startLine":1,"endLine":200}]}}]}',
-    '{"toolCalls":[{"tool":"read_file_range_by_symbols","args":{"path":"relative/path","symbols":["Foo","Bar"],"maxChars":12000}}]}',
-    '{"toolCalls":[{"tool":"list_files","args":{"include":"**/*","exclude":"**/node_modules/**","maxResults":200}}]}',
-    '{"toolCalls":[{"tool":"file_stat","args":{"path":"relative/path"}}]}',
-    '{"toolCalls":[{"tool":"read_dir","args":{"path":"relative/path","maxDepth":3,"maxEntries":400}}]}',
-    '{"toolCalls":[{"tool":"read_output","args":{"maxChars":12000,"tail":true}}]}',
-    'When done, respond with {"final":"..."} and no other text.',
-    'If no tool is needed, respond with {"final":"..."}.'
-  ];
-  const ctx = buildChatContextBlock(context);
-  if (ctx) {
-    base.push('', 'CONTEXT:', ctx);
-  }
-  return base.join('\n');
-}
-
-function buildAgentSystemPrompt(context) {
-  const base = [
-    'You are a coding agent.',
-    'Provide a concise plan and actionable steps.',
-    'If you propose code changes, include file paths and minimal patches or snippets.',
-    'Ask a clarifying question if required.',
-    'Do not perform a code review unless the user explicitly asks.',
-    '',
-    'You can use tools to inspect and modify the workspace. Respond with JSON only.',
-    'Prefer non-interactive commands (use flags like --yes). Keep commands scoped to the workspace.',
-    'After making changes, verify the workspace state (a tree and file list may be provided) before returning the final response.',
-    'If workspace problems are provided, attempt to resolve them before finishing when possible.',
-    'Maintain a TODO list in your JSON responses using {"todo":[{"id":"1","text":"...","status":"pending|done"}]}. Update statuses as you complete steps.',
-    'When using edit_file or replace_range, set newText to ONLY the replacement lines for the specified range.',
-    'Do not include unchanged context lines before/after the range, and do not re-emit entire functions/files for small edits.',
-    'Avoid duplicate imports or JSX blocks; when adding an import, insert only the new line.',
-    'When the user mentions a file name or extension (e.g., about.md), use locate_file and do not call search.',
-    'Do not use any tools that are not listed below. Only the tools listed below are available to you.',
-    'Tool schema:',
-    '{"toolCalls":[{"tool":"search","args":{"query":"text","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"locate_file","args":{"query":"about.md","include":"**/*","exclude":"**/node_modules/**","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"search_symbols","args":{"query":"SymbolName","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"workspace_symbols","args":{"query":"SymbolName","maxResults":20}}]}',
-    '{"toolCalls":[{"tool":"document_symbols","args":{"uri":"src/App.jsx"}}]}',
-    '{"toolCalls":[{"tool":"definition","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"type_definition","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"implementation","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"references","args":{"uri":"src/App.jsx","line":10,"character":5,"includeDeclaration":true}}]}',
-    '{"toolCalls":[{"tool":"hover","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"signature_help","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"call_hierarchy_prepare","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"call_hierarchy_incoming","args":{"itemId":"chi_123"}}]}',
-    '{"toolCalls":[{"tool":"call_hierarchy_outgoing","args":{"itemId":"chi_123"}}]}',
-    '{"toolCalls":[{"tool":"rename_prepare","args":{"uri":"src/App.jsx","line":10,"character":5}}]}',
-    '{"toolCalls":[{"tool":"rename_apply","args":{"uri":"src/App.jsx","line":10,"character":5,"newName":"newSymbolName"}}]}',
-    '{"toolCalls":[{"tool":"semantic_tokens","args":{"uri":"src/App.jsx","range":{"startLine":1,"startCharacter":1,"endLine":50,"endCharacter":1}}}]}',
-    '{"toolCalls":[{"tool":"read_file","args":{"path":"relative/path","startLine":1,"endLine":200}}]}',
-    '{"toolCalls":[{"tool":"read_files","args":{"paths":["src/App.jsx","src/main.jsx"],"ranges":[{"startLine":1,"endLine":200},{"startLine":1,"endLine":200}]}}]}',
-    '{"toolCalls":[{"tool":"read_file_range_by_symbols","args":{"path":"relative/path","symbols":["Foo","Bar"],"maxChars":12000}}]}',
-    '{"toolCalls":[{"tool":"edit_file","args":{"path":"relative/path","startLine":1,"endLine":5,"newText":"replacement text"}}]}',
-    '{"toolCalls":[{"tool":"insert_text","args":{"path":"relative/path","position":{"line":10,"character":5},"text":"text to insert"}}]}',
-    '{"toolCalls":[{"tool":"replace_range","args":{"path":"relative/path","range":{"startLine":10,"startChar":1,"endLine":12,"endChar":1},"text":"replacement text"}}]}',
-    '{"toolCalls":[{"tool":"copy_file","args":{"from":"relative/path","to":"relative/path","overwrite":false}}]}',
-    '{"toolCalls":[{"tool":"apply_patch_preview","args":{"patch":"diff content","cwd":"."}}]}',
-    '{"toolCalls":[{"tool":"apply_patch","args":{"patch":"diff content","cwd":"."}}]}',
-    '{"toolCalls":[{"tool":"list_files","args":{"include":"**/*","exclude":"**/node_modules/**","maxResults":200}}]}',
-    '{"toolCalls":[{"tool":"file_stat","args":{"path":"relative/path"}}]}',
-    '{"toolCalls":[{"tool":"write_file","args":{"path":"relative/path","content":"text","overwrite":false,"append":false}}]}',
-    '{"toolCalls":[{"tool":"create_dir","args":{"path":"relative/path"}}]}',
-    '{"toolCalls":[{"tool":"delete_file","args":{"path":"relative/path","recursive":false}}]}',
-    '{"toolCalls":[{"tool":"move_file","args":{"from":"relative/path","to":"relative/path","overwrite":false}}]}',
-    '{"toolCalls":[{"tool":"read_dir","args":{"path":"relative/path","maxDepth":3,"maxEntries":400}}]}',
-    '{"toolCalls":[{"tool":"read_output","args":{"maxChars":12000,"tail":true}}]}',
-    '{"toolCalls":[{"tool":"run_command","args":{"command":"npm create vite@latest app -- --template react","cwd":".","timeoutMs":60000}}]}',
-    'When done, respond with {"final":"..."} and no other text.',
-    'If no tool is needed, respond with {"final":"..."}.'
-  ];
-  const ctx = buildChatContextBlock(context);
-  if (ctx) {
-    base.push('', 'CONTEXT:', ctx);
-  }
-  return base.join('\n');
-}
-
 function parseAgentResponse(text) {
   const parsed = safeJsonParse(text) || safeJsonParse(extractFirstJsonPayload(text));
   if (!parsed || typeof parsed !== 'object') return null;
   const todo = Array.isArray(parsed.todo) ? parsed.todo : (Array.isArray(parsed.todos) ? parsed.todos : null);
   const normalizedTodo = todo ? normalizeTodoList(todo) : null;
+  const hasPlan = Array.isArray(parsed.plan);
+  const normalizedPlan = hasPlan ? normalizePlanList(parsed.plan) : null;
   const parsedText = typeof parsed.text === 'string' ? parsed.text : '';
-  if (typeof parsed.final === 'string') return { final: parsed.final, todo: normalizedTodo };
-  if (typeof parsed.reply === 'string') return { final: parsed.reply, todo: normalizedTodo };
+  if (typeof parsed.final === 'string') {
+    const out = { final: parsed.final, todo: normalizedTodo };
+    if (hasPlan) out.plan = normalizedPlan;
+    return out;
+  }
+  if (typeof parsed.reply === 'string') {
+    const out = { final: parsed.reply, todo: normalizedTodo };
+    if (hasPlan) out.plan = normalizedPlan;
+    return out;
+  }
   if (Array.isArray(parsed.toolCalls)) {
-    return { toolCalls: parsed.toolCalls, todo: normalizedTodo, text: parsedText };
+    const out = { toolCalls: parsed.toolCalls, todo: normalizedTodo, text: parsedText };
+    if (hasPlan) out.plan = normalizedPlan;
+    return out;
   }
   if (parsed.tool && typeof parsed.tool === 'string') {
-    return { toolCalls: [{ tool: parsed.tool, args: parsed.args || {} }], todo: normalizedTodo, text: parsedText };
+    const out = { toolCalls: [{ tool: parsed.tool, args: parsed.args || {} }], todo: normalizedTodo, text: parsedText };
+    if (hasPlan) out.plan = normalizedPlan;
+    return out;
   }
-  if (normalizedTodo) return { todo: normalizedTodo, text: parsedText };
+  if (normalizedTodo || (normalizedPlan && normalizedPlan.length) || hasPlan) {
+    const out = { todo: normalizedTodo, text: parsedText };
+    if (hasPlan) out.plan = normalizedPlan;
+    return out;
+  }
   return null;
 }
 
@@ -1947,6 +2001,24 @@ function normalizeTodoList(input) {
   return list;
 }
 
+function normalizePlanItem(item, index) {
+  if (!item || typeof item !== 'object') {
+    return { id: `plan_${index + 1}`, text: String(item || '').trim(), status: 'pending' };
+  }
+  const text = String(item.text || item.title || item.description || '').trim();
+  if (!text) return null;
+  const id = String(item.id || `plan_${index + 1}`);
+  const statusRaw = String(item.status || '').toLowerCase();
+  const status = statusRaw === 'done' || statusRaw === 'complete' ? 'done' : 'pending';
+  return { id, text, status };
+}
+
+function normalizePlanList(input) {
+  if (!Array.isArray(input)) return [];
+  const list = input.map((item, index) => normalizePlanItem(item, index)).filter(Boolean);
+  return list;
+}
+
 function mergeTodoLists(current, incoming) {
   const next = normalizeTodoList(incoming || []);
   if (!next.length) return normalizeTodoList(current || []);
@@ -2009,6 +2081,22 @@ async function applyTodoUpdate(incoming) {
   postChatState();
 }
 
+async function setTodoList(nextTodos) {
+  chatState.todos = normalizeTodoList(nextTodos || []);
+  if (activeChatThreadId) {
+    await updateChatThreadTodos(activeChatThreadId, chatState.todos);
+  }
+  postChatState();
+}
+
+async function applyPlanUpdate(incoming) {
+  chatState.plan = normalizePlanList(incoming || []);
+  if (activeChatThreadId) {
+    await updateChatThreadPlan(activeChatThreadId, chatState.plan);
+  }
+  postChatState();
+}
+
 function stripCodeFence(text) {
   const trimmed = String(text || '').trim();
   if (!trimmed.startsWith('```')) return trimmed;
@@ -2054,6 +2142,16 @@ function seedTodosFromPrompt(promptText) {
     status: 'pending'
   }));
   return seeded;
+}
+
+function seedTodosFromPlan(plan) {
+  const items = normalizePlanList(plan || []);
+  if (!items.length) return [];
+  return items.map((item, index) => ({
+    id: `todo_${index + 1}`,
+    text: item.text,
+    status: 'pending'
+  }));
 }
 
 function formatDiagnosticSeverity(severity) {
@@ -2217,7 +2315,8 @@ async function buildSmartSearchMessages(text) {
       const payload = `Symbol search results for \`${term}\` (${formatted.length}):\n` + formatted.join('\n');
       messages.push({ role: 'assistant', content: formatToolResultForUi('search', payload) });
     } else {
-      const textResults = await getToolRunner().toolSearch({ query: term, include: '**/*', exclude: '**/node_modules/**', maxResults: 20 });
+      const searchArgs = { query: term, include: '**/*', exclude: '**/node_modules/**', maxResults: 20 };
+      const textResults = await runToolWithSugar('search', searchArgs, () => getToolRunner().toolSearch(searchArgs));
       const payload = `No code symbols found for \`${term}\`. Text search results:\n${textResults}`;
       messages.push({ role: 'assistant', content: formatToolResultForUi('search', payload) });
     }
@@ -2595,6 +2694,24 @@ function isToolResultSuccess(resultText) {
   return true;
 }
 
+function isSearchResultMiss(resultText) {
+  const raw = String(resultText || '').trim().toLowerCase();
+  if (!raw) return true;
+  if (raw.startsWith('search failed:')) return true;
+  if (raw.startsWith('search results: no matches')) return true;
+  if (raw.startsWith('search redirected to locate_file') && raw.includes('locate file: no matches')) return true;
+  return false;
+}
+
+function buildSearchSignature(args) {
+  const safe = args && typeof args === 'object' ? args : {};
+  const query = String(safe.query || '').trim();
+  const include = String(safe.include || '**/*').trim() || '**/*';
+  const exclude = String(safe.exclude || '**/node_modules/**').trim() || '**/node_modules/**';
+  const maxResults = Number.isFinite(Number(safe.maxResults)) ? Number(safe.maxResults) : 20;
+  return JSON.stringify({ query, include, exclude, maxResults });
+}
+
 function buildToolBatchSummary(calls) {
   if (!Array.isArray(calls) || !calls.length) return '';
   const grouped = new Map();
@@ -2783,6 +2900,9 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
   let bareTodoRepeatCount = 0;
   let lastCommandSignature = null;
   let sawMutationSinceCommand = false;
+  let lastSearchSignature = null;
+  let lastSearchWasMiss = false;
+  let sawMutationSinceSearch = false;
   let mutationSinceProblems = false;
   let lastSuccessfulSummary = '';
 
@@ -2794,7 +2914,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       uiMessages.push({ role: 'assistant', content: 'Stopped.' });
       chatState.messages = uiMessages;
       postChatState();
-      return;
+      return 'stopped';
     }
     const pendingTodos = getPendingTodos(chatState.todos);
     const plannerText = pendingTodos.length ? buildPlannerInstruction(chatState.todos) : '';
@@ -2816,7 +2936,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       });
       chatState.messages = uiMessages;
       postChatState();
-      return;
+      return 'failure';
     }
     let parsed = parseAgentResponse(assistantText);
     if (!parsed) {
@@ -2841,7 +2961,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
         uiMessages.push({ role: 'assistant', content: lastSuccessfulSummary });
       }
       chatState.messages = uiMessages;
-      return;
+      return 'success';
     }
 
     if (parsed.final) {
@@ -2873,7 +2993,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       setAgentContinuation(null);
       uiMessages.push({ role: 'assistant', content: parsed.final });
       chatState.messages = uiMessages;
-      return;
+      return 'success';
     }
 
     if (parsed.toolCalls && parsed.toolCalls.length) {
@@ -2938,6 +3058,36 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
           continue;
         }
 
+        if (normalizedCall && normalizedCall.tool === 'search') {
+          const signature = buildSearchSignature(normalizedCall.args);
+          if (lastSearchSignature
+              && signature === lastSearchSignature
+              && lastSearchWasMiss
+              && !sawMutationSinceSearch) {
+            const skipped = 'Skipped: search already run with the same args and no file changes since then. Update the query or modify files to try again.';
+            const resultText = formatToolResultForUi('search', skipped);
+            uiMessages.push({ role: 'assistant', content: resultText });
+            modelMessages.push({ role: 'user', content: resultText });
+            modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
+            chatState.messages = uiMessages;
+            postChatState();
+            continue;
+          }
+
+          const result = await runToolCall(normalizedCall);
+          if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
+          lastSearchSignature = signature;
+          lastSearchWasMiss = isSearchResultMiss(result);
+          sawMutationSinceSearch = false;
+          const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
+          uiMessages.push({ role: 'assistant', content: resultText });
+          modelMessages.push({ role: 'user', content: resultText });
+          modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
+          chatState.messages = uiMessages;
+          postChatState();
+          continue;
+        }
+
         const result = await runToolCall(normalizedCall);
         if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
         const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
@@ -2949,6 +3099,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
 
         if (normalizedCall && mutatingTools.has(normalizedCall.tool)) {
           sawMutationSinceCommand = true;
+          sawMutationSinceSearch = true;
           mutationSinceProblems = true;
         }
       }
@@ -2977,7 +3128,8 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       const summary = buildToolBatchSummary(executedCalls);
       if (summary) {
         uiMessages.push({ role: 'assistant', content: summary });
-        modelMessages.push({ role: 'assistant', content: summary });
+        // Treat summary like a tool observation so model messages end with user/tool.
+        modelMessages.push({ role: 'user', content: summary });
         modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
         chatState.messages = uiMessages;
         postChatState();
@@ -3022,7 +3174,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       setAgentContinuation(null);
       uiMessages.push({ role: 'assistant', content: cleanedBody || assistantText });
       chatState.messages = uiMessages;
-      return;
+      return 'success';
     }
     const todoSignature = parsed.todo ? JSON.stringify(normalizeTodoList(parsed.todo)) : null;
     if (todoSignature && todoSignature === lastBareTodoSignature) {
@@ -3059,7 +3211,7 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
       setAgentContinuation(null);
       uiMessages.push({ role: 'assistant', content: 'All TODO items completed.' });
       chatState.messages = uiMessages;
-      return;
+      return 'success';
     }
     // Keep looping to execute the next pending TODO.
     continue;
@@ -3068,14 +3220,19 @@ async function runAgentTurn(baseMessages, modelMessagesSeed) {
   setAgentContinuation(modelMessages);
   uiMessages.push({ role: 'assistant', content: 'Agent stopped: too many tool steps.' });
   chatState.messages = uiMessages;
+  return 'failure';
 }
 
 async function runToolCall(call) {
-  try {
-    return await getToolRunner().runToolCall(call);
-  } catch (err) {
-    return `Tool failed: ${String(err && err.message ? err.message : err)}`;
-  }
+  const tool = call && typeof call.tool === 'string' ? call.tool : '';
+  const args = call && typeof call.args === 'object' ? call.args : {};
+  return await runToolWithSugar(tool, args, async () => {
+    try {
+      return await getToolRunner().runToolCall(call);
+    } catch (err) {
+      return `Tool failed: ${String(err && err.message ? err.message : err)}`;
+    }
+  });
 }
 
 async function callModelForChat({ messages, mode, context }) {
@@ -3083,14 +3240,13 @@ async function callModelForChat({ messages, mode, context }) {
   const baseUrl = (cfg.get('ollamaBaseUrl', 'http://127.0.0.1:11434/v1') || '').replace(/\/+$/, '');
   const model = getActiveChatModel();
 
-  const system = mode === 'agent' ? buildAgentSystemPrompt(context) : buildChatSystemPrompt(context);
+  const system = buildSystemPrompt(mode, context);
   const allMessages = [{ role: 'system', content: system }, ...messages];
 
   const body = {
     model,
     messages: allMessages,
     temperature: 0.2,
-    tools: mode === 'agent' ? AGENT_TOOL_SCHEMAS : CHAT_TOOL_SCHEMAS,
     tool_choice: 'auto'
   };
 
@@ -3128,896 +3284,16 @@ async function callModelForChat({ messages, mode, context }) {
   }
 }
 
-function getChatHtml(webview) {
+async function getChatHtml(webview) {
   const scriptUri = extensionContext
     ? webview.asWebviewUri(vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'chat.js'))
     : '';
   const csp = `default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource}`;
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="${csp}">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    :root {
-      --bg: var(--vscode-editor-background);
-      --fg: var(--vscode-foreground);
-      --panel: var(--vscode-editorWidget-background);
-      --border: var(--vscode-editorWidget-border);
-      --accent: var(--vscode-button-background);
-      --accent-fg: var(--vscode-button-foreground);
-      --muted: var(--vscode-descriptionForeground);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      color: var(--fg);
-      background: linear-gradient(160deg, rgba(120, 130, 150, 0.12), rgba(30, 40, 60, 0.12)), var(--bg);
-      font-family: 'Space Grotesk', 'Avenir Next', 'Segoe UI', sans-serif;
-    }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 8px;
-      padding: 10px 16px;
-      border-bottom: 1px solid var(--border);
-      backdrop-filter: blur(8px);
-    }
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    select, button {
-      font: inherit;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--fg);
-      padding: 6px 10px;
-    }
-    select.thread-select {
-      min-width: 160px;
-      max-width: 240px;
-    }
-    select.model-select {
-      min-width: 160px;
-      max-width: 240px;
-    }
-    button.icon {
-      width: 30px;
-      height: 30px;
-      padding: 0;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 600;
-    }
-    button.primary {
-      background: var(--accent);
-      color: var(--accent-fg);
-      border-color: var(--accent);
-    }
-    button:disabled {
-      opacity: 0.6;
-    }
-    .tabs {
-      display: flex;
-      gap: 6px;
-      padding: 8px 16px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .tab-button {
-      border: none;
-      border-bottom: 2px solid transparent;
-      border-radius: 0;
-      padding: 8px 12px;
-      font-size: 12px;
-      background: transparent;
-      color: var(--muted);
-    }
-    .tab-button.active {
-      color: var(--fg);
-      border-bottom-color: var(--accent);
-    }
-    .tab-panel {
-      display: none;
-      flex: 1;
-      min-height: 0;
-      flex-direction: column;
-    }
-    .tab-panel.active {
-      display: flex;
-    }
-    .context-bar {
-      padding: 10px 16px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .context-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .context-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--fg);
-      font-size: 12px;
-    }
-    .chip-label {
-      max-width: 220px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .chip button {
-      border: none;
-      background: transparent;
-      color: var(--muted);
-      padding: 0;
-      cursor: pointer;
-    }
-    .context-toolbar {
-      padding: 10px 16px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .context-count {
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .context-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .context-card {
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .context-title {
-      font-weight: 600;
-      font-size: 13px;
-      color: var(--fg);
-    }
-    .context-meta {
-      font-size: 11px;
-      color: var(--muted);
-    }
-    .context-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .context-editor {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .context-preview {
-      margin: 0;
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: rgba(0, 0, 0, 0.2);
-      font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 11px;
-      white-space: pre-wrap;
-      max-height: 200px;
-      overflow: auto;
-    }
-    .context-editor input,
-    .context-editor textarea {
-      font: inherit;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: rgba(0, 0, 0, 0.12);
-      color: var(--fg);
-      padding: 6px 10px;
-    }
-    .context-empty {
-      padding: 24px;
-      text-align: center;
-      font-size: 12px;
-      color: var(--muted);
-      border: 1px dashed var(--border);
-      border-radius: 12px;
-    }
-    .context-bar .context-empty {
-      padding: 0;
-      border: none;
-      text-align: left;
-    }
-    .approvals {
-      padding: 12px 16px 0;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .approval-card {
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: rgba(0, 0, 0, 0.2);
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      font-size: 12px;
-    }
-    .approval-title {
-      font-weight: 600;
-      color: var(--fg);
-    }
-    .approval-details {
-      color: var(--muted);
-      white-space: pre-wrap;
-    }
-    .approval-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .todos {
-      padding: 12px 16px 0;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .todo-card {
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: rgba(0, 0, 0, 0.18);
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      font-size: 12px;
-    }
-    .todo-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-    }
-    .todo-title {
-      font-weight: 600;
-      color: var(--fg);
-    }
-    .todo-close {
-      border: none;
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--muted);
-      width: 22px;
-      height: 22px;
-      border-radius: 999px;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 14px;
-      line-height: 1;
-    }
-    .todo-close:hover {
-      color: var(--fg);
-      background: rgba(255, 255, 255, 0.16);
-    }
-    .todo-item {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-    }
-    .todo-item.done {
-      color: rgba(180, 255, 200, 0.9);
-      text-decoration: line-through;
-    }
-    .todo-pill {
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      padding: 2px 8px;
-      font-size: 10px;
-      color: var(--fg);
-      background: rgba(0, 0, 0, 0.2);
-    }
-    .context-form {
-      border-top: 1px solid var(--border);
-      padding: 12px 16px 16px;
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 10px;
-    }
-    .context-form textarea {
-      resize: vertical;
-      min-height: 80px;
-      max-height: 200px;
-    }
-    .hint {
-      font-size: 11px;
-      color: var(--muted);
-      text-align: center;
-    }
-    .chat {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .msg {
-      max-width: 90%;
-      padding: 10px 12px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      white-space: pre-wrap;
-      line-height: 1.4;
-    }
-    .msg.user {
-      align-self: flex-end;
-      background: var(--accent);
-      color: var(--accent-fg);
-      border-color: var(--accent);
-    }
-    .msg.assistant {
-      align-self: flex-start;
-    }
-    .msg.assistant h1,
-    .msg.assistant h2,
-    .msg.assistant h3 {
-      margin: 0 0 8px;
-      font-weight: 600;
-    }
-    .msg.assistant h1 { font-size: 16px; }
-    .msg.assistant h2 { font-size: 15px; }
-    .msg.assistant h3 { font-size: 14px; }
-    .msg.assistant p {
-      margin: 0 0 8px;
-    }
-    .msg.assistant p:last-child {
-      margin-bottom: 0;
-    }
-    .msg.assistant ul,
-    .msg.assistant ol {
-      margin: 0 0 8px 18px;
-      padding: 0;
-    }
-    .msg.assistant code {
-      font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      background: rgba(0, 0, 0, 0.18);
-      padding: 2px 4px;
-      border-radius: 6px;
-    }
-    .msg.assistant pre {
-      margin: 0 0 8px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: rgba(0, 0, 0, 0.25);
-      overflow-x: auto;
-    }
-    .msg.assistant pre code {
-      background: transparent;
-      padding: 0;
-      border-radius: 0;
-      font-size: 12px;
-    }
-    .msg.assistant pre code.code-block {
-      counter-reset: line;
-      display: block;
-    }
-    .msg.assistant pre code.code-block .code-line {
-      display: block;
-      position: relative;
-      padding-left: 36px;
-      white-space: pre;
-    }
-    .msg.assistant pre code.code-block .code-line::before {
-      counter-increment: line;
-      content: counter(line);
-      position: absolute;
-      left: 0;
-      width: 28px;
-      text-align: right;
-      color: var(--muted);
-      opacity: 0.7;
-    }
-    .msg.assistant pre code.code-block .line-text {
-      display: inline-block;
-      min-width: 0;
-    }
-    .msg.assistant pre code .token.keyword { color: #7fd6ff; }
-    .msg.assistant pre code .token.string { color: #ffd28c; }
-    .msg.assistant pre code .token.number { color: #b4f1a2; }
-    .msg.assistant pre code .token.comment { color: #8b96a8; font-style: italic; }
-    .diff-block {
-      margin: 0 0 8px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: rgba(0, 0, 0, 0.28);
-      overflow-x: auto;
-    }
-    .diff-line {
-      display: block;
-      white-space: pre;
-    }
-    .diff-add {
-      background: rgba(66, 185, 131, 0.18);
-      color: #a8f0c6;
-    }
-    .diff-del {
-      background: rgba(235, 87, 87, 0.18);
-      color: #ffb3b3;
-    }
-    .diff-hunk {
-      color: #9bbcff;
-    }
-    .msg.assistant a {
-      color: var(--accent);
-      text-decoration: none;
-    }
-    .msg.assistant a:hover {
-      text-decoration: underline;
-    }
-    .msg.assistant table.md-table {
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      margin: 0 0 8px;
-      font-size: 12px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      overflow: hidden;
-      background: rgba(0, 0, 0, 0.2);
-    }
-    .msg.assistant table.md-table th,
-    .msg.assistant table.md-table td {
-      padding: 8px 10px;
-      text-align: left;
-      vertical-align: top;
-      border-bottom: 1px solid var(--border);
-      border-right: 1px solid var(--border);
-    }
-    .msg.assistant table.md-table th:last-child,
-    .msg.assistant table.md-table td:last-child {
-      border-right: none;
-    }
-    .msg.assistant table.md-table tr:last-child td {
-      border-bottom: none;
-    }
-    .msg.assistant table.md-table thead th {
-      font-weight: 600;
-      color: var(--fg);
-      background: rgba(0, 0, 0, 0.28);
-    }
-    .composer {
-      border-top: 1px solid var(--border);
-      padding: 12px 16px 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .composer-frame {
-      position: relative;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      padding: 10px 12px 44px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .rich-input {
-      min-height: 72px;
-      max-height: 240px;
-      width: 100%;
-      border: none;
-      background: transparent;
-      color: var(--fg);
-      font: inherit;
-      padding: 0;
-      outline: none;
-      white-space: pre-wrap;
-      word-break: break-word;
-      overflow-y: auto;
-    }
-    .rich-input:empty::before {
-      content: attr(data-placeholder);
-      color: var(--muted);
-    }
-    .rich-input .token-command {
-      color: #7fd6ff;
-      font-weight: 600;
-    }
-    .command-menu {
-      position: absolute;
-      left: 12px;
-      right: 12px;
-      bottom: 56px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 6px;
-      display: none;
-      flex-direction: column;
-      gap: 4px;
-      max-height: 200px;
-      overflow-y: auto;
-      z-index: 5;
-      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
-    }
-    .command-menu.is-open {
-      display: flex;
-    }
-    .command-item {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 6px 8px;
-      border-radius: 8px;
-      font-size: 12px;
-      cursor: pointer;
-      color: var(--fg);
-    }
-    .command-item:hover,
-    .command-item.is-active {
-      background: rgba(127, 214, 255, 0.16);
-    }
-    .command-name {
-      font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
-      color: #7fd6ff;
-    }
-    .command-desc {
-      color: var(--muted);
-      font-size: 11px;
-    }
-    textarea {
-      resize: vertical;
-      min-height: 72px;
-      max-height: 240px;
-      width: 100%;
-      border: none;
-      background: transparent;
-      color: var(--fg);
-      font: inherit;
-      padding: 0;
-      outline: none;
-    }
-    .mode-picker {
-      position: absolute;
-      left: 12px;
-      bottom: 10px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .mode-pill {
-      position: relative;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 2px 8px 2px 6px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: rgba(0, 0, 0, 0.2);
-      font-size: 11px;
-      color: var(--fg);
-    }
-    .debug-toggle {
-      margin-left: 6px;
-      width: 26px;
-      height: 26px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: rgba(0, 0, 0, 0.2);
-      color: var(--muted);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      padding: 0;
-    }
-    .debug-toggle.is-active {
-      color: var(--accent-fg);
-      border-color: var(--accent);
-      background: rgba(255, 255, 255, 0.08);
-    }
-    .debug-toggle svg {
-      width: 14px;
-      height: 14px;
-      display: block;
-    }
-    .mode-select {
-      appearance: none;
-      border: none;
-      background: transparent;
-      color: inherit;
-      font: inherit;
-      padding: 0 10px 0 2px;
-      margin: 0;
-      line-height: 1.4;
-      cursor: pointer;
-    }
-    .mode-select.model-select {
-      max-width: 180px;
-    }
-    .mode-select:focus {
-      outline: none;
-    }
-    .mode-chevron {
-      width: 0;
-      height: 0;
-      border-left: 4px solid transparent;
-      border-right: 4px solid transparent;
-      border-top: 5px solid var(--muted);
-      margin-left: -6px;
-    }
-    .sr-only {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      padding: 0;
-      margin: -1px;
-      overflow: hidden;
-      clip: rect(0, 0, 0, 0);
-      border: 0;
-    }
-    .primary {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-    }
-    .primary:disabled {
-      opacity: 0.9;
-      cursor: default;
-    }
-    .send-thinking {
-      display: none;
-    }
-    .primary.is-thinking .send-label {
-      display: none;
-    }
-    .primary.is-thinking .send-thinking {
-      display: inline-flex;
-    }
-    .ai-thinking-grid {
-      --size: 18px;
-      --gap: 2px;
-      --dot: 4px;
-      --c: var(--accent-fg);
-      width: var(--size);
-      height: var(--size);
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: var(--gap);
-    }
-    .ai-thinking-grid > span {
-      width: var(--dot);
-      height: var(--dot);
-      place-self: center;
-      background: var(--c);
-      border-radius: 2px;
-      opacity: 0.35;
-      transform: scale(0.85);
-      animation: aiGridPulse 1.1s infinite ease-in-out;
-    }
-    .ai-thinking-grid > span:nth-child(1){animation-delay: 0ms;}
-    .ai-thinking-grid > span:nth-child(2){animation-delay: 90ms;}
-    .ai-thinking-grid > span:nth-child(3){animation-delay: 180ms;}
-    .ai-thinking-grid > span:nth-child(4){animation-delay: 90ms;}
-    .ai-thinking-grid > span:nth-child(5){animation-delay: 180ms;}
-    .ai-thinking-grid > span:nth-child(6){animation-delay: 270ms;}
-    .ai-thinking-grid > span:nth-child(7){animation-delay: 180ms;}
-    .ai-thinking-grid > span:nth-child(8){animation-delay: 270ms;}
-    .ai-thinking-grid > span:nth-child(9){animation-delay: 360ms;}
-    @keyframes aiGridPulse {
-      0%, 100% { opacity: 0.35; transform: scale(0.85); }
-      50% { opacity: 1; transform: scale(1.1); }
-    }
-    .composer-controls {
-      position: absolute;
-      right: 10px;
-      bottom: 8px;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .send-button {
-      min-width: 72px;
-    }
-    .stop-button {
-      display: none;
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--fg);
-      font-size: 11px;
-      padding: 6px 10px;
-      border-radius: 999px;
-    }
-    .stop-button.is-visible {
-      display: inline-flex;
-    }
-    .status {
-      font-size: 11px;
-      color: var(--muted);
-      text-align: center;
-    }
-    .tool-block {
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: rgba(0, 0, 0, 0.18);
-      padding: 8px 10px;
-    }
-    .tool-block summary {
-      cursor: pointer;
-      color: var(--fg);
-      font-weight: 600;
-      font-size: 12px;
-      list-style: none;
-    }
-    .tool-summary-title {
-      display: block;
-    }
-    .tool-summary-meta {
-      display: block;
-      font-weight: 400;
-      font-size: 11px;
-      color: var(--muted);
-      margin-top: 2px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .tool-block summary::-webkit-details-marker {
-      display: none;
-    }
-    .tool-block summary::before {
-      content: '▸';
-      display: inline-block;
-      margin-right: 6px;
-      color: var(--muted);
-    }
-    .tool-block[open] summary::before {
-      content: '▾';
-    }
-    .tool-body {
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--muted);
-      background: var(--vscode-editor-background);
-      padding: 8px 10px;
-      border-radius: 8px;
-    }
-    .tool-actions {
-      display: flex;
-      justify-content: flex-end;
-      margin-bottom: 8px;
-    }
-    .tool-revert {
-      border: none;
-      background: transparent;
-      color: var(--accent-fg);
-      font-size: 11px;
-      cursor: pointer;
-      text-decoration: underline;
-      padding: 0;
-    }
-    .tool-revert:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-      text-decoration: none;
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="controls">
-      <label for="threadSelect">Chat</label>
-      <select id="threadSelect" class="thread-select"></select>
-      <button id="newChat" class="icon" title="New chat">+</button>
-    </div>
-  </header>
-  <div class="tabs">
-    <button class="tab-button active" data-tab="chat">Chat</button>
-    <button class="tab-button" data-tab="context">Context</button>
-  </div>
-  <section id="tabChat" class="tab-panel active">
-    <div id="todos" class="todos"></div>
-    <div id="approvals" class="approvals"></div>
-    <div id="chat" class="chat"></div>
-    <div class="composer">
-      <div class="composer-frame">
-        <div id="input" class="rich-input" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="Ask a question or describe a task..."></div>
-        <div id="commandMenu" class="command-menu" aria-hidden="true"></div>
-        <div class="mode-picker">
-          <label for="mode" class="sr-only">Mode</label>
-          <div class="mode-pill">
-            <select id="mode" class="mode-select">
-              <option value="chat">Chat</option>
-              <option value="agent">Agent</option>
-            </select>
-            <span class="mode-chevron" aria-hidden="true"></span>
-          </div>
-          <label for="modelSelect" class="sr-only">Model</label>
-          <div class="mode-pill">
-            <select id="modelSelect" class="mode-select model-select"></select>
-            <span class="mode-chevron" aria-hidden="true"></span>
-          </div>
-          <button id="debugListen" class="debug-toggle" type="button" title="Toggle debug snapshot listening" aria-pressed="false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M8 9h8M9 3l1 2M15 3l-1 2M4 13h4m8 0h4M6 19h12M10 9v10M14 9v10M8 5h8a4 4 0 0 1 4 4v4a6 6 0 0 1-6 6h0a6 6 0 0 1-6-6V9a4 4 0 0 1 4-4z"/>
-            </svg>
-          </button>
-        </div>
-        <div class="composer-controls">
-          <button id="stop" class="stop-button" type="button">Stop</button>
-          <button id="send" class="primary send-button">
-            <span class="send-label">Send</span>
-            <span class="send-thinking" aria-hidden="true">
-              <span class="ai-thinking-grid" aria-label="AI thinking" role="img">
-                <span></span><span></span><span></span>
-                <span></span><span></span><span></span>
-                <span></span><span></span><span></span>
-              </span>
-            </span>
-          </button>
-        </div>
-      </div>
-      <div id="status" class="status">Loading chat...</div>
-    </div>
-  </section>
-  <section id="tabContext" class="tab-panel">
-    <div class="context-toolbar">
-      <button id="addContextFromSelectionDetail" title="Add selection as context">Add selection</button>
-      <button id="clearContextAll" title="Clear all contexts">Clear all</button>
-      <span id="contextCountDetail" class="context-count"></span>
-    </div>
-    <div id="contextList" class="context-list"></div>
-    <div class="context-form">
-      <textarea id="contextNote" placeholder="Add a note or summary to keep in context..."></textarea>
-      <div class="composer-actions">
-        <button id="addContextNote" class="primary">Add note</button>
-        <div class="hint">Notes become part of chat context.</div>
-      </div>
-    </div>
-  </section>
-  <script src="${scriptUri}"></script>
-</body>
-</html>`;
+  const chatViewPath = vscode.Uri.joinPath(extensionContext.extensionUri, 'views', 'chatView.html');
+  const bytes = await vscode.workspace.fs.readFile(chatViewPath);
+  let html = Buffer.from(bytes).toString('utf8');
+  html = html.replace('${csp}', csp).replace('${scriptUri}', String(scriptUri));
+  return html;
 }
 
 function ensureSqliteAvailable() {
@@ -4059,6 +3335,7 @@ async function initChatDb(context) {
       'title TEXT NOT NULL,' +
       'context_json TEXT,' +
       'todo_json TEXT,' +
+      'plan_json TEXT,' +
       'created_at TEXT NOT NULL,' +
       'updated_at TEXT NOT NULL' +
     ')'
@@ -4080,6 +3357,10 @@ async function initChatDb(context) {
     const hasTodo = columns.some((col) => col && col.name === 'todo_json');
     if (!hasTodo) {
       await dbRun('ALTER TABLE chat_threads ADD COLUMN todo_json TEXT');
+    }
+    const hasPlan = columns.some((col) => col && col.name === 'plan_json');
+    if (!hasPlan) {
+      await dbRun('ALTER TABLE chat_threads ADD COLUMN plan_json TEXT');
     }
   } catch {
     // ignore migration errors
@@ -4142,7 +3423,7 @@ async function ensureChatReady() {
     activeChatThreadId = first ? first.id : null;
   }
   if (!activeChatThreadId) {
-    activeChatThreadId = await createChatThread({ title: defaultChatTitle(), context: null, todos: [] });
+    activeChatThreadId = await createChatThread({ title: defaultChatTitle(), context: null, todos: [], plan: [] });
   }
   if (activeChatThreadId) {
     await loadChatThread(activeChatThreadId);
@@ -4167,15 +3448,16 @@ async function refreshChatThreads() {
   }));
 }
 
-async function createChatThread({ title, context, todos }) {
+async function createChatThread({ title, context, todos, plan }) {
   if (!chatDb) return null;
   const now = new Date().toISOString();
   const safeTitle = String(title || defaultChatTitle()).trim() || defaultChatTitle();
   const ctxJson = context ? JSON.stringify(context) : null;
   const todoJson = todos && todos.length ? JSON.stringify(todos) : null;
+  const planJson = plan && plan.length ? JSON.stringify(plan) : null;
   const info = await dbRun(
-    'INSERT INTO chat_threads (title, context_json, todo_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
-    [safeTitle, ctxJson, todoJson, now, now]
+    'INSERT INTO chat_threads (title, context_json, todo_json, plan_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [safeTitle, ctxJson, todoJson, planJson, now, now]
   );
   const id = info && info.lastID ? String(info.lastID) : null;
   if (id) {
@@ -4190,7 +3472,7 @@ async function loadChatThread(threadId) {
   if (!chatDb) return;
   const normId = normalizeThreadId(threadId);
   if (!normId) return;
-  const row = await dbGet('SELECT id, title, context_json, todo_json FROM chat_threads WHERE id = ?', [normId]);
+  const row = await dbGet('SELECT id, title, context_json, todo_json, plan_json FROM chat_threads WHERE id = ?', [normId]);
   if (!row) return;
   const rows = await dbAll(
     'SELECT role, content FROM chat_messages WHERE thread_id = ? ORDER BY id ASC',
@@ -4204,6 +3486,8 @@ async function loadChatThread(threadId) {
   chatState.contexts = normalizeContextList(parsed);
   const todoParsed = row.todo_json ? safeJsonParse(row.todo_json) : null;
   chatState.todos = normalizeTodoList(todoParsed || []);
+  const planParsed = row.plan_json ? safeJsonParse(row.plan_json) : null;
+  chatState.plan = normalizePlanList(planParsed || []);
   chatState.approvals = [];
 }
 
@@ -4238,6 +3522,14 @@ async function updateChatThreadTodos(threadId, todos) {
   if (!normId) return;
   const todoJson = todos && todos.length ? JSON.stringify(todos) : null;
   await dbRun('UPDATE chat_threads SET todo_json = ? WHERE id = ?', [todoJson, normId]);
+}
+
+async function updateChatThreadPlan(threadId, plan) {
+  if (!chatDb) return;
+  const normId = normalizeThreadId(threadId);
+  if (!normId) return;
+  const planJson = plan && plan.length ? JSON.stringify(plan) : null;
+  await dbRun('UPDATE chat_threads SET plan_json = ? WHERE id = ?', [planJson, normId]);
 }
 
 async function touchChatThread(threadId) {

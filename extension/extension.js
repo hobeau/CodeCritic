@@ -11,6 +11,7 @@ const {
 const { registerReviewFeature, clearAllThreads } = require('./features/review');
 const { registerChatFeature } = require('./features/chat');
 const { registerAdoFeature } = require('./features/ado');
+const { registerAiSugarFeature } = require('./features/aiSugar');
 
 /** @type {vscode.CommentController | undefined} */
 let controller;
@@ -94,6 +95,7 @@ function activate(context) {
   registerReviewFeature({ context, controller, threadState });
   registerChatFeature({ context, threadState });
   registerAdoFeature({ context, controller, threadState });
+  registerAiSugarFeature({ context });
 }
 
 function deactivate() {

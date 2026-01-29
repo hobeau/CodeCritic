@@ -39,6 +39,7 @@ let state = {
   mode: 'chat',
   contexts: [],
   todos: [],
+  plan: [],
   messages: [],
   busy: false,
   threads: [],
@@ -201,6 +202,27 @@ function setCaretIndex(el, index) {
   }
 }
 
+function insertPlainTextAtCursor(el, text) {
+  if (!el) return;
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) {
+    el.innerText = (el.innerText || '') + text;
+    return;
+  }
+  const range = selection.getRangeAt(0);
+  if (!el.contains(range.startContainer)) {
+    el.innerText = (el.innerText || '') + text;
+    return;
+  }
+  range.deleteContents();
+  const node = document.createTextNode(text);
+  range.insertNode(node);
+  range.setStartAfter(node);
+  range.collapse(true);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 function renderRichInput() {
   if (!inputEl) return;
   const text = getInputValue();
@@ -356,12 +378,29 @@ function stripLineNumberPrefix(code) {
   return { text: strippedLines.join('\n'), stripped: true };
 }
 
+function isHtmlLanguage(lang) {
+  const normalized = String(lang || '').trim().toLowerCase();
+  return normalized === 'html' || normalized === 'htm' || normalized === 'xhtml';
+}
+
+function isLikelyHtml(code) {
+  const trimmed = String(code || '').trim().toLowerCase();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('<!doctype') || trimmed.startsWith('<html')) return true;
+  if (trimmed.startsWith('<') && /<\/?[a-z][\s\S]*>/i.test(trimmed)) return true;
+  return false;
+}
+
 function buildCodeBlockHtml(code, lang) {
   const normalized = stripLineNumberPrefix(code);
   const highlighted = highlightCode(normalized.text);
   const withLines = wrapCodeLines(highlighted);
   const klass = lang ? ' class="code-block language-' + escapeHtml(lang) + '"' : ' class="code-block"';
-  return '<pre><code' + klass + '>' + withLines + '</code></pre>';
+  const wantsPreview = isHtmlLanguage(lang) || (!lang && isLikelyHtml(normalized.text));
+  const encoded = escapeHtml(encodeURIComponent(normalized.text));
+  const button = wantsPreview ? '<button class="preview-btn" type="button" aria-label="Preview HTML">Preview</button>' : '';
+  const wrapperClass = wantsPreview ? 'code-block-wrapper has-preview' : 'code-block-wrapper';
+  return '<div class="' + wrapperClass + '">' + button + '<pre data-code="' + encoded + '"><code' + klass + '>' + withLines + '</code></pre></div>';
 }
 
 function isTableSeparator(line) {
@@ -409,7 +448,7 @@ function renderMarkdown(text) {
       blocks.push(html);
       return '@@BLOCK' + (blocks.length - 1) + '@@';
     }
-    const html = buildCodeBlockHtml(code, lang);
+    const html = buildCodeBlockHtml(code, langSafe);
     blocks.push(html);
     return '@@BLOCK' + (blocks.length - 1) + '@@';
   });
@@ -694,6 +733,66 @@ function formatApprovalDetails(details) {
   return String(details || '').trim();
 }
 
+function sendApprovalResponse(id, approved) {
+  if (!id) return false;
+  if (!postVsCodeMessage({ type: 'approvalResponse', id, approved })) {
+    if (statusEl) statusEl.textContent = 'Unable to send approval response';
+    return false;
+  }
+  return true;
+}
+
+function handleApprovalAction(button) {
+  if (!button) return false;
+  const id = button.dataset.id;
+  const action = button.dataset.action;
+  if (!id || !action) return false;
+  const approved = action === 'approve';
+  return sendApprovalResponse(id, approved);
+}
+
+function buildApprovalBlock(item) {
+  const approval = document.createElement('div');
+  approval.className = 'tool-approval';
+  const header = document.createElement('div');
+  header.className = 'approval-header';
+  const icon = document.createElement('span');
+  icon.className = 'approval-icon';
+  icon.textContent = '!';
+  const title = document.createElement('span');
+  title.textContent = item.title || 'Action required';
+  header.appendChild(icon);
+  header.appendChild(title);
+  approval.appendChild(header);
+
+  const detailText = formatApprovalDetails(item.details);
+  if (detailText) {
+    const message = document.createElement('div');
+    message.className = 'approval-message';
+    message.textContent = detailText;
+    approval.appendChild(message);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'danger';
+  cancelBtn.textContent = item.cancelLabel || 'Cancel';
+  cancelBtn.dataset.action = 'cancel';
+  cancelBtn.dataset.id = item.id;
+  const approveBtn = document.createElement('button');
+  approveBtn.type = 'button';
+  approveBtn.className = 'primary';
+  approveBtn.textContent = item.approveLabel || 'Approve';
+  approveBtn.dataset.action = 'approve';
+  approveBtn.dataset.id = item.id;
+  actions.appendChild(cancelBtn);
+  actions.appendChild(approveBtn);
+  approval.appendChild(actions);
+  return approval;
+}
+
 function renderApprovals() {
   if (!approvalsEl) return;
   approvalsEl.innerHTML = '';
@@ -709,27 +808,9 @@ function renderApprovals() {
     details.className = 'approval-details';
     const detailText = formatApprovalDetails(item.details);
     details.textContent = detailText;
-    const actions = document.createElement('div');
-    actions.className = 'approval-actions';
-
-    const approveBtn = document.createElement('button');
-    approveBtn.type = 'button';
-    approveBtn.textContent = item.approveLabel || 'Approve';
-    approveBtn.dataset.action = 'approve';
-    approveBtn.dataset.id = item.id;
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.textContent = item.cancelLabel || 'Cancel';
-    cancelBtn.dataset.action = 'cancel';
-    cancelBtn.dataset.id = item.id;
-
-    actions.appendChild(approveBtn);
-    actions.appendChild(cancelBtn);
-
     card.appendChild(title);
     if (detailText) card.appendChild(details);
-    card.appendChild(actions);
+    card.appendChild(buildApprovalBlock(item).querySelector('.approval-actions'));
     approvalsEl.appendChild(card);
   }
 }
@@ -737,30 +818,33 @@ function renderApprovals() {
 function renderTodos() {
   if (!todosEl) return;
   todosEl.innerHTML = '';
-  const todos = Array.isArray(state.todos) ? state.todos : [];
-  if (!todos.length) return;
+  const isAgent = state.mode === 'agent';
+  const planItems = Array.isArray(state.plan) ? state.plan : [];
+  const todoItems = Array.isArray(state.todos) ? state.todos : [];
+  const items = isAgent ? todoItems : planItems;
+  if (!items.length) return;
   const card = document.createElement('div');
   card.className = 'todo-card';
   const header = document.createElement('div');
   header.className = 'todo-header';
   const title = document.createElement('div');
   title.className = 'todo-title';
-  title.textContent = 'Plan';
+  title.textContent = isAgent ? 'Todos' : 'Plan';
   const closeBtn = document.createElement('button');
   closeBtn.className = 'todo-close';
   closeBtn.type = 'button';
   closeBtn.textContent = '×';
-  closeBtn.title = 'Clear plan';
+  closeBtn.title = isAgent ? 'Clear todos' : 'Clear plan';
   header.appendChild(title);
   header.appendChild(closeBtn);
   card.appendChild(header);
 
-  for (const item of todos) {
+  for (const item of items) {
     const row = document.createElement('div');
     row.className = 'todo-item' + (item.status === 'done' ? ' done' : '');
     const pill = document.createElement('span');
     pill.className = 'todo-pill';
-    pill.textContent = item.status === 'done' ? 'Done' : 'Next';
+    pill.textContent = item.status === 'done' ? 'Done' : (isAgent ? 'Next' : 'Step');
     const text = document.createElement('span');
     text.textContent = item.text || '';
     row.appendChild(pill);
@@ -786,7 +870,7 @@ function extractRevertMeta(text) {
   return { text: cleaned.trim(), revertId };
 }
 
-function buildToolBlock(contents) {
+function buildToolBlock(contents, approvalItem) {
   const items = Array.isArray(contents) ? contents : [contents];
   const text = String(items[0] || '');
   const lines = text.split('\n');
@@ -804,6 +888,13 @@ function buildToolBlock(contents) {
   summaryTitle.className = 'tool-summary-title';
   summaryTitle.textContent = summaryText || 'Tool';
   summary.appendChild(summaryTitle);
+  if (approvalItem) {
+    details.classList.add('is-pending');
+    const status = document.createElement('span');
+    status.className = 'tool-status-badge pending';
+    status.textContent = 'Awaiting approval';
+    summary.appendChild(status);
+  }
   if (summaryText.startsWith('Tool call: run_command')) {
     const cmdMatch = /- command:\s*`([^`]+)`/m.exec(text);
     const cmd = cmdMatch ? cmdMatch[1] : '';
@@ -837,37 +928,48 @@ function buildToolBlock(contents) {
   body.appendChild(content);
   details.appendChild(summary);
   details.appendChild(body);
+  if (approvalItem) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'tool-block-wrapper';
+    const footer = document.createElement('div');
+    footer.className = 'tool-approval-footer';
+    footer.appendChild(buildApprovalBlock(approvalItem));
+    wrapper.appendChild(details);
+    wrapper.appendChild(footer);
+    return wrapper;
+  }
   return details;
 }
 
 function renderMessages(messages) {
   chatEl.innerHTML = '';
+  const pendingApprovals = Array.isArray(state.approvals) ? [...state.approvals] : [];
   for (let i = 0; i < (messages || []).length; i += 1) {
     const msg = messages[i];
     const div = document.createElement('div');
     div.className = 'msg ' + (msg.role === 'user' ? 'user' : 'assistant');
-    if (msg.role === 'assistant') {
-      const content = msg.content || '';
-      if (isToolMessage(content)) {
-        const group = [content];
-        let j = i + 1;
-        const isToolCall = String(content || '').trim().startsWith('Tool call:');
-        while (j < messages.length) {
-          const next = messages[j];
-          if (!next || next.role !== 'assistant' || !isToolMessage(next.content || '')) break;
-          const nextIsCall = String(next.content || '').trim().startsWith('Tool call:');
-          if (nextIsCall && isToolCall) break;
-          if (nextIsCall && !isToolCall) break;
-          group.push(next.content || '');
-          j += 1;
-        }
-        div.appendChild(buildToolBlock(group));
-        i = j - 1;
-      } else {
-        div.innerHTML = renderMarkdown(content);
+    const content = msg.content || '';
+    if (isToolMessage(content)) {
+      div.classList.add('msg-tool-call');
+      const group = [content];
+      let j = i + 1;
+      const isToolCall = String(content || '').trim().startsWith('Tool call:');
+      while (j < messages.length) {
+        const next = messages[j];
+        if (!next || next.role !== 'assistant' || !isToolMessage(next.content || '')) break;
+        const nextIsCall = String(next.content || '').trim().startsWith('Tool call:');
+        if (nextIsCall && isToolCall) break;
+        if (nextIsCall && !isToolCall) break;
+        group.push(next.content || '');
+        j += 1;
       }
+      const approvalItem = isToolCall && pendingApprovals.length ? pendingApprovals.shift() : null;
+      div.appendChild(buildToolBlock(group, approvalItem));
+      i = j - 1;
+    } else if (msg.role === 'assistant') {
+      div.innerHTML = renderMarkdown(content);
     } else {
-      div.textContent = msg.content || '';
+      div.textContent = content;
     }
     chatEl.appendChild(div);
   }
@@ -1034,10 +1136,31 @@ window.addEventListener('message', (event) => {
 document.addEventListener('click', (event) => {
   const target = event.target;
   if (!target) return;
+
+  const previewBtn = target.closest('.preview-btn');
+  if (previewBtn) {
+    const wrapper = previewBtn.closest('.code-block-wrapper');
+    const pre = wrapper ? wrapper.querySelector('pre[data-code]') : null;
+    const encoded = pre && pre.dataset ? pre.dataset.code : '';
+    if (encoded) {
+      let decoded = '';
+      try {
+        decoded = decodeURIComponent(encoded);
+      } catch {
+        decoded = encoded;
+      }
+      if (decoded) {
+        postVsCodeMessage({ type: 'previewHtml', code: decoded });
+      }
+    }
+    return;
+  }
+
   const todoClose = target.closest('button.todo-close');
   if (todoClose) {
     if (!postVsCodeMessage({ type: 'clearTodos' })) {
-      if (statusEl) statusEl.textContent = 'Unable to clear plan';
+      const label = state.mode === 'agent' ? 'todos' : 'plan';
+      if (statusEl) statusEl.textContent = `Unable to clear ${label}`;
     }
     return;
   }
@@ -1091,21 +1214,14 @@ if (contextChips) {
   });
 }
 
-if (approvalsEl) {
-  approvalsEl.addEventListener('click', (event) => {
-    const target = event.target;
-    if (!target) return;
-    const button = target.closest('button[data-action]');
-    if (!button) return;
-    const id = button.dataset.id;
-    const action = button.dataset.action;
-  if (!id || !action) return;
-  const approved = action === 'approve';
-  if (!postVsCodeMessage({ type: 'approvalResponse', id, approved })) {
-    if (statusEl) statusEl.textContent = 'Unable to send approval response';
+document.addEventListener('click', (event) => {
+  const target = event.target;
+  if (!target) return;
+  const button = target.closest('button[data-action="approve"], button[data-action="cancel"]');
+  if (button && handleApprovalAction(button)) {
+    event.preventDefault();
   }
 });
-}
 
 if (contextList) {
   contextList.addEventListener('click', (event) => {
@@ -1326,9 +1442,24 @@ if (inputEl) {
     setTimeout(() => hideCommandMenu(), 120);
   });
   inputEl.addEventListener('paste', (e) => {
+    const data = e.clipboardData || window.clipboardData;
+    const text = data ? data.getData('text/plain') : '';
+    if (!text) return;
     e.preventDefault();
-    const text = (e.clipboardData || window.clipboardData).getData('text/plain');
-    document.execCommand('insertText', false, text);
+    let handled = false;
+    try {
+      handled = typeof document.execCommand === 'function'
+        ? document.execCommand('insertText', false, text)
+        : false;
+    } catch {
+      handled = false;
+    }
+    if (!handled) {
+      insertPlainTextAtCursor(inputEl, text);
+    }
+    renderRichInput();
+    updateCommandMenu();
+    updateSendState();
   });
 }
 

@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbital Core System</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <script>
+        /**
+         * ORBITAL CORE SYSTEM - CONFIGURABLE PARAMETERS
+         * ==============================================
+         * 
+         * Modify the CONFIG object below to customize the visualization.
+         * All parameters can be changed at runtime via JavaScript by accessing
+         * window.ORBITAL_CONFIG from external code.
+         */
+
+        const CONFIG = {
+            /* CORE ANIMATION PARAMETERS */
+            
+            // ORBITAL_SPEED: Controls how fast particles and the core grid rotate
+            // Range: 0.1 (slow) to 5.0 (very fast)
+            // Default: 1.0
+            orbitalSpeed: 1.0,
+            
+            // BREATH_SPEED: Controls the speed of the expansion/contraction cycle
+            // Range: 0.1 (slow pulse) to 5.0 (rapid pulse)
+            // Default: 0.5
+            breathSpeed: 0.5,
+            
+            // BREATH_AMP: Controls how much the orb expands and contracts (0-1 scale)
+            // 0.0 = no breathing (static size)
+            // 0.5 = subtle pulse (default)
+            // 1.0 = dramatic expansion/contraction
+            breathAmp: 0.5,
+            
+            // GLOBAL_SCALE: Multiplies the overall size of the entire system
+            // 0.5 = half size
+            // 1.0 = default (fits most screens)
+            // 2.0 = double size (extends off screen)
+            // 3.0 = maximum (for large displays)
+            globalScale: 0.5,
+            
+            /* DISTORTION & PHYSICS */
+            
+            // WARP_FACTOR: Adds organic turbulence/noise to the circular orbits
+            // 0.0 = perfect circles (default)
+            // 0.5 = wobbly, organic paths
+            // 1.0 = chaotic, highly distorted
+            warpFactor: 0.0,
+            
+            // ATTRACTOR_STRENGTH: Controls the pull of the two invisible attractor points
+            // 0.0 = pure circular orbits (no attractor influence)
+            // 1.0 = moderate attraction, creates figure-8 patterns (default)
+            // 2.0 = strong attraction, particles pulled toward attractors heavily
+            attractorStrength: 0.0,
+            
+            /* VISUAL EFFECTS */
+            
+            // GLITCH_FACTOR: Probability and intensity of holographic glitch events
+            // 0.0 = no glitches (stable system)
+            // 0.5 = frequent minor distortions
+            // 1.0 = constant heavy glitching (system instability)
+            glitchFactor: 0.0,
+            
+            // PARTICLE_SHAPE: Morphology of individual particles
+            // Options: 'default' (circle), 'cross', 'triangle', 'square', 
+            //          'diamond', 'star', 'binary' (0/1 digits)
+            particleShape: 'default',
+            
+            /* COLOR & THEME */
+            
+            // BASE_HUE: Starting color for the blue palette (0-360)
+            // 200 = cyan-blue (default JARVIS style)
+            // 180 = teal
+            // 240 = purple-blue
+            // 0 = red (emergency)
+            // 120 = green (success)
+            baseHue: 200,
+            
+            /* MESSAGE SYSTEM */
+            
+            // MESSAGE_DURATION: How long text stays on screen after fully typed (in frames, ~60fps)
+            // 120 = 2 seconds
+            // 300 = 5 seconds (default)
+            messageDuration: 300,
+            
+            // TYPING_SPEED: How fast characters appear in the typewriter effect
+            // 0.5 = slow, dramatic
+            // 1.0 = normal (default)
+            // 3.0 = fast
+            typingSpeed: 1.0,
+            
+            /* ALERT SYSTEM */
+            
+            // ALERT_DURATION: How long red/green alert flashes last (milliseconds)
+            // 2500 = 2.5 seconds (default)
+            alertDuration: 2500
+        };
+
+        /**
+         * EXTERNAL API
+         * ============
+         * These functions are exposed to window so you can control the system
+         * from external JavaScript code:
+         * 
+         * window.transmitMessage("YOUR TEXT HERE") - Displays text with typewriter effect
+         * window.triggerAlert("red") - Flash red (emergency)
+         * window.triggerAlert("green") - Flash green (success)
+         * window.updateConfig({ orbitalSpeed: 2.0, breathAmp: 0.8 }) - Update params
+         */
+
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        let width, height, centerX, centerY;
+        
+        function resize() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+            centerX = width / 2;
+            centerY = height / 2;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // Internal state (do not modify directly)
+        const State = {
+            alert: { active: false, type: 'red', startTime: 0, intensity: 0 },
+            glitch: { active: false, intensity: 1.0, timer: 0, scanlineOffset: 0 },
+            message: { 
+                text: '', displayText: '', active: false, progress: 0, 
+                timer: 0, fadeOut: false, opacity: 0, cursorVisible: true, cursorTimer: 0 
+            },
+            attractors: [
+                { angle: 0, radius: 120, speed: 0.01 },
+                { angle: Math.PI, radius: 100, speed: -0.015 }
+            ]
+        };
+
+        // Utility functions
+        const noise = (x, y, z) => Math.sin(x * 0.5) * Math.cos(y * 0.5) * Math.sin(z * 0.5) + Math.sin(x * 1.3 + z) * Math.cos(y * 0.8);
+        const glitchNoise = (seed) => (Math.random() - 0.5) * seed;
+        
+        // Color interpolation based on alert state
+        function getHue(baseHue) {
+            if (State.alert.intensity === 0) return baseHue;
+            if (State.alert.type === 'red') return baseHue * (1 - State.alert.intensity);
+            return baseHue + (120 - baseHue) * State.alert.intensity;
+        }
+        
+        function getLightness(baseL) {
+            if (State.alert.type === 'red' && State.alert.intensity > 0) return baseL - (State.alert.intensity * 10);
+            return baseL;
+        }
+
+        // Shape drawing functions
+        function drawShape(ctx, x, y, size, shape, rotation) {
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(rotation);
+            
+            switch(shape) {
+                case 'cross':
+                    ctx.beginPath();
+                    ctx.moveTo(-size, 0); ctx.lineTo(size, 0);
+                    ctx.moveTo(0, -size); ctx.lineTo(0, size);
+                    ctx.lineWidth = size * 0.4; ctx.stroke();
+                    break;
+                case 'triangle':
+                    ctx.beginPath();
+                    ctx.moveTo(0, -size);
+                    ctx.lineTo(size * 0.866, size * 0.5);
+                    ctx.lineTo(-size * 0.866, size * 0.5);
+                    ctx.closePath(); ctx.fill();
+                    break;
+                case 'square':
+                    ctx.fillRect(-size * 0.7, -size * 0.7, size * 1.4, size * 1.4);
+                    break;
+                case 'diamond':
+                    ctx.beginPath();
+                    ctx.moveTo(0, -size); ctx.lineTo(size, 0);
+                    ctx.lineTo(0, size); ctx.lineTo(-size, 0);
+                    ctx.closePath(); ctx.fill();
+                    break;
+                case 'star':
+                    ctx.beginPath();
+                    for (let i = 0; i < 10; i++) {
+                        const r = i % 2 === 0 ? size : size * 0.4;
+                        const a = (i * Math.PI * 2) / 10 - Math.PI / 2;
+                        ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+                    }
+                    ctx.closePath(); ctx.fill();
+                    break;
+                case 'binary':
+                    ctx.font = `bold ${size * 2}px 'Courier New'`;
+                    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                    ctx.fillText(Math.random() > 0.5 ? '1' : '0', 0, 0);
+                    break;
+                default: // default circle
+                    ctx.beginPath();
+                    ctx.arc(0, 0, size, 0, Math.PI * 2);
+                    ctx.fill();
+            }
+            ctx.restore();
+        }
+
+        // Spherical Energy Grid Class
+        class SphericalGrid {
+            constructor() {
+                this.radius = 35;
+                this.points = [];
+                this.connections = [];
+                this.rotation = { x: 0, y: 0, z: 0 };
+                this.initPoints();
+            }
+            
+            initPoints() {
+                const count = 40;
+                const phi = Math.PI * (3 - Math.sqrt(5));
+                
+                for (let i = 0; i < count; i++) {
+                    const y = 1 - (i / (count - 1)) * 2;
+                    const radius = Math.sqrt(1 - y * y);
+                    const theta = phi * i;
+                    const x = Math.cos(theta) * radius;
+                    const z = Math.sin(theta) * radius;
+                    
+                    this.points.push({
+                        baseX: x * this.radius, baseY: y * this.radius, baseZ: z * this.radius,
+                        x: 0, y: 0, z: 0, size: 1.5 + Math.random(),
+                        noiseOffset: Math.random() * 1000, glitchOffset: { x: 0, y: 0, z: 0 }
+                    });
+                }
+                
+                // Calculate connections (nearest neighbors)
+                for (let i = 0; i < this.points.length; i++) {
+                    const p1 = this.points[i];
+                    const distances = [];
+                    for (let j = 0; j < this.points.length; j++) {
+                        if (i === j) continue;
+                        const p2 = this.points[j];
+                        const dx = p1.baseX - p2.baseX;
+                        const dy = p1.baseY - p2.baseY;
+                        const dz = p1.baseZ - p2.baseZ;
+                        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                        distances.push({ index: j, dist: dist });
+                    }
+                    distances.sort((a, b) => a.dist - b.dist);
+                    for (let k = 0; k < 3; k++) {
+                        if (distances[k].dist < this.radius * 1.2) {
+                            this.connections.push({ 
+                                from: i, to: distances[k].index,
+                                strength: 1 - (distances[k].dist / (this.radius * 1.2))
+                            });
+                        }
+                    }
+                }
+            }
+            
+            update(time, breathe) {
+                this.rotation.x += 0.005 * CONFIG.orbitalSpeed;
+                this.rotation.y += 0.003 * CONFIG.orbitalSpeed;
+                this.rotation.z += 0.002 * CONFIG.orbitalSpeed;
+                
+                const pulse = 1 + breathe * 0.15;
+                const scale = CONFIG.globalScale;
+                const glitchIntensity = State.glitch.active ? State.glitch.intensity * 20 : 0;
+                
+                this.points.forEach((p, i) => {
+                    let x = p.baseX, y = p.baseY, z = p.baseZ;
+                    
+                    // Apply warp distortion
+                    if (CONFIG.warpFactor > 0) {
+                        const w = CONFIG.warpFactor;
+                        x += noise(p.baseX * 0.05, p.baseY * 0.05, time * 0.01 + p.noiseOffset) * 20 * w;
+                        y += noise(p.baseY * 0.05, p.baseZ * 0.05, time * 0.01 + p.noiseOffset) * 20 * w;
+                        z += noise(p.baseZ * 0.05, p.baseX * 0.05, time * 0.01 + p.noiseOffset) * 20 * w;
+                    }
+                    
+                    // Apply glitch
+                    if (State.glitch.active) {
+                        p.glitchOffset.x = glitchNoise(glitchIntensity) * (1 + Math.sin(time * 0.5 + i) * 0.5);
+                        p.glitchOffset.y = glitchNoise(glitchIntensity) * (1 + Math.cos(time * 0.3 + i) * 0.5);
+                        p.glitchOffset.z = glitchNoise(glitchIntensity * 0.5);
+                        x += p.glitchOffset.x; y += p.glitchOffset.y; z += p.glitchOffset.z;
+                    }
+                    
+                    // Rotate
+                    let x1 = x * Math.cos(this.rotation.y) - z * Math.sin(this.rotation.y);
+                    let z1 = x * Math.sin(this.rotation.y) + z * Math.cos(this.rotation.y);
+                    x = x1; z = z1;
+                    let y1 = y * Math.cos(this.rotation.x) - z * Math.sin(this.rotation.x);
+                    let z2 = y * Math.sin(this.rotation.x) + z * Math.cos(this.rotation.x);
+                    y = y1; z = z2;
+                    let x2 = x * Math.cos(this.rotation.z) - y * Math.sin(this.rotation.z);
+                    let y2 = x * Math.sin(this.rotation.z) + y * Math.cos(this.rotation.z);
+                    x = x2; y = y2;
+                    
+                    const pointPulse = Math.sin(time * 0.05 + i * 0.5) * 3;
+                    const finalScale = (pulse + pointPulse * 0.02) * scale;
+                    
+                    p.x = centerX + x * finalScale;
+                    p.y = centerY + y * finalScale;
+                    p.z = z * finalScale;
+                    p.currentSize = p.size * (1 + breathe * 0.3) * scale;
+                    
+                    if (State.glitch.active) p.currentSize *= (1 + glitchNoise(State.glitch.intensity * 0.5));
+                });
+            }
+            
+            draw(ctx) {
+                const lineHue = getHue(200);
+                const pointHue = getHue(190);
+                const hueShift = State.glitch.active ? glitchNoise(60) : 0;
+                
+                // Draw connections sorted by depth
+                const sortedConnections = this.connections.map(c => {
+                    const p1 = this.points[c.from];
+                    const p2 = this.points[c.to];
+                    return { ...c, avgZ: (p1.z + p2.z) / 2 };
+                }).sort((a, b) => a.avgZ - b.avgZ);
+                
+                sortedConnections.forEach(c => {
+                    const p1 = this.points[c.from];
+                    const p2 = this.points[c.to];
+                    if (p1.z > -20 * CONFIG.globalScale && p2.z > -20 * CONFIG.globalScale) {
+                        let alpha = (p1.z + this.radius * CONFIG.globalScale) / (this.radius * CONFIG.globalScale * 2) * 0.5 * c.strength;
+                        if (State.glitch.active) {
+                            alpha *= (0.5 + Math.random() * 0.5);
+                            ctx.lineWidth = (1 * CONFIG.globalScale) * (0.5 + Math.random());
+                        } else {
+                            ctx.lineWidth = 1 * CONFIG.globalScale;
+                        }
+                        ctx.strokeStyle = `hsla(${lineHue + hueShift}, 100%, ${getLightness(60)}%, ${alpha})`;
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y);
+                        if (State.glitch.active && Math.random() < 0.1) {
+                            ctx.lineTo(p2.x + glitchNoise(10), p2.y + glitchNoise(10));
+                        } else {
+                            ctx.lineTo(p2.x, p2.y);
+                        }
+                        ctx.stroke();
+                    }
+                });
+                
+                // Draw points
+                this.points.forEach(p => {
+                    if (p.z > -20 * CONFIG.globalScale) {
+                        const radius = this.radius * CONFIG.globalScale;
+                        let alpha = (p.z + radius) / (radius * 2) * 0.9;
+                        let size = p.currentSize * (1 + p.z / (radius * 2));
+                        const finalHue = pointHue + hueShift + (State.glitch.active ? glitchNoise(30) : 0);
+                        
+                        ctx.fillStyle = `hsla(${finalHue}, 100%, ${getLightness(70)}%, ${alpha})`;
+                        drawShape(ctx, p.x, p.y, size, 'default', 0);
+                        
+                        if (size > 2 || State.glitch.active) {
+                            ctx.fillStyle = `hsla(${finalHue}, 100%, ${getLightness(60)}%, ${alpha * 0.3})`;
+                            drawShape(ctx, p.x, p.y, size * 2, 'default', 0);
+                        }
+                    }
+                });
+            }
+        }
+
+        // Orbital Particle Class
+        class Particle {
+            constructor(shell) {
+                this.shell = shell; // 0 = inner, 1 = mid, 2 = outer
+                this.reset();
+                this.assignShape();
+            }
+            
+            assignShape() {
+                this.rotation = Math.random() * Math.PI * 2;
+                this.rotSpeed = (Math.random() - 0.5) * 0.1;
+            }
+            
+            reset() {
+                this.angle = Math.random() * Math.PI * 2;
+                this.height = (Math.random() - 0.5) * 50;
+                const shellRadii = [90, 160, 230];
+                this.baseRadius = shellRadii[this.shell] + (Math.random() - 0.5) * 25;
+                this.baseSpeed = (0.0015 + Math.random() * 0.002) * (4 - this.shell);
+                if (Math.random() > 0.5) this.baseSpeed *= -1;
+                this.noiseOffset = Math.random() * 1000;
+                this.size = 0.8 + Math.random() * 1.8;
+                this.life = 0;
+                this.maxLife = 200 + Math.random() * 300;
+                this.baseHue = CONFIG.baseHue + (this.shell * 12) + Math.random() * 25;
+                this.glitchOffset = { x: 0, y: 0 };
+            }
+            
+            update(time, breathe) {
+                this.life++;
+                this.rotation += this.rotSpeed * CONFIG.orbitalSpeed;
+                
+                if (this.life < 60) this.alpha = this.life / 60;
+                else if (this.life > this.maxLife - 60) this.alpha = (this.maxLife - this.life) / 60;
+                else this.alpha = 1;
+                
+                if (this.life >= this.maxLife) {
+                    this.life = 0; this.reset(); this.assignShape(); this.alpha = 0;
+                }
+                
+                const breatheFactor = 1 + breathe * 0.25;
+                const scale = CONFIG.globalScale;
+                let r = this.baseRadius * breatheFactor;
+                
+                // Warp distortion
+                if (CONFIG.warpFactor > 0) {
+                    const warpNoise = noise(Math.cos(this.angle) * 3, Math.sin(this.angle) * 3, time * 0.01 + this.noiseOffset);
+                    r += warpNoise * 40 * CONFIG.warpFactor;
+                }
+                
+                // Attractor physics
+                let attractorForceX = 0, attractorForceY = 0;
+                if (CONFIG.attractorStrength > 0 && !State.glitch.active) {
+                    let minDist = Infinity, nearest = null;
+                    State.attractors.forEach(a => {
+                        const ax = a.x, ay = a.y;
+                        const dx = ax - (centerX + Math.cos(this.angle) * r);
+                        const dy = ay - (centerY + Math.sin(this.angle) * r);
+                        const d = Math.sqrt(dx*dx + dy*dy);
+                        if (d < minDist) { minDist = d; nearest = {x: ax, y: ay}; }
+                    });
+                    if (nearest) {
+                        const dx = nearest.x - (centerX + Math.cos(this.angle) * r);
+                        const dy = nearest.y - (centerY + Math.sin(this.angle) * r);
+                        const force = CONFIG.attractorStrength * 0.002;
+                        attractorForceX = dx * force; attractorForceY = dy * force;
+                    }
+                }
+                
+                // Update angle
+                const noiseVal = noise(Math.cos(this.angle) * 0.5, Math.sin(this.angle) * 0.5, time * 0.0005 + this.noiseOffset);
+                const wobble = noiseVal * 0.015;
+                this.angle += this.baseSpeed * CONFIG.orbitalSpeed + wobble;
+                
+                const radiusNoise = noise(this.angle * 2, time * 0.001, this.noiseOffset) * 15;
+                r += radiusNoise; r *= scale;
+                
+                // Calculate position
+                let x = centerX + Math.cos(this.angle) * r;
+                let y = centerY + Math.sin(this.angle) * r;
+                x += attractorForceX * r; y += attractorForceY * r;
+                
+                // Additional warp
+                if (CONFIG.warpFactor > 0) {
+                    const posNoise = noise(x * 0.01 / scale, y * 0.01 / scale, time * 0.005 + this.noiseOffset);
+                    x += Math.cos(posNoise * Math.PI * 2) * 20 * CONFIG.warpFactor * scale;
+                    y += Math.sin(posNoise * Math.PI * 2) * 20 * CONFIG.warpFactor * scale;
+                }
+                
+                // Glitch
+                if (State.glitch.active) {
+                    this.glitchOffset.x = glitchNoise(State.glitch.intensity * 25);
+                    this.glitchOffset.y = glitchNoise(State.glitch.intensity * 25);
+                    x += this.glitchOffset.x; y += this.glitchOffset.y;
+                }
+                
+                this.x = x; this.y = y;
+                this.z = (this.height + Math.sin(time * 0.01 + this.noiseOffset) * 15) * scale;
+                if (State.glitch.active) this.z += glitchNoise(State.glitch.intensity * 20);
+                
+                const depthScale = 1 + (this.z / (150 * scale));
+                this.currentSize = this.size * depthScale * scale;
+                if (State.glitch.active) {
+                    this.currentSize *= (1 + glitchNoise(State.glitch.intensity * 0.8));
+                    this.currentSize = Math.max(0.1, this.currentSize);
+                }
+                
+                this.currentAlpha = this.alpha * (0.5 + 0.5 * depthScale);
+                if (State.glitch.active) this.currentAlpha *= (0.3 + Math.random() * 0.7);
+            }
+            
+            draw(ctx) {
+                const hue = getHue(this.baseHue) + (State.glitch.active ? glitchNoise(40) : 0);
+                const lightness = getLightness(65);
+                ctx.fillStyle = `hsla(${hue}, 100%, ${lightness}%, ${this.currentAlpha})`;
+                drawShape(ctx, this.x, this.y, this.currentSize, CONFIG.particleShape, this.rotation);
+            }
+        }
+
+        // Initialize systems
+        const coreGrid = new SphericalGrid();
+        const particles = [];
+        for (let i = 0; i < 900; i++) {
+            const shell = i < 250 ? 0 : i < 600 ? 1 : 2;
+            particles.push(new Particle(shell));
+        }
+
+        // Particle connections (plexus)
+        function drawConnections() {
+            const maxDist = 55 * CONFIG.globalScale;
+            for (let i = 0; i < particles.length; i++) {
+                const p1 = particles[i];
+                if (p1.alpha < 0.1) continue;
+                for (let j = i + 1; j < Math.min(i + 15, particles.length); j++) {
+                    const p2 = particles[j];
+                    if (p2.alpha < 0.1) continue;
+                    const dx = p1.x - p2.x, dy = p1.y - p2.y;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    if (dist < maxDist) {
+                        let opacity = (1 - dist / maxDist) * 0.2 * p1.alpha * p2.alpha;
+                        const hue = getHue(210) + (State.glitch.active ? glitchNoise(20) : 0);
+                        if (State.glitch.active) {
+                            opacity *= Math.random();
+                            if (Math.random() < 0.1) continue;
+                        }
+                        ctx.strokeStyle = `hsla(${hue}, 100%, ${getLightness(60)}%, ${opacity})`;
+                        ctx.lineWidth = 0.5 * CONFIG.globalScale * (State.glitch.active ? Math.random() : 1);
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        // Core glow effect
+        function drawCoreGlow(time, breathe) {
+            const pulse = 1 + breathe * 0.2;
+            const r = 45 * pulse * CONFIG.globalScale;
+            
+            let centerColor, midColor, outerColor;
+            if (State.alert.type === 'red' && State.alert.intensity > 0) {
+                centerColor = `rgba(255, ${100 - State.alert.intensity * 100}, ${100 - State.alert.intensity * 100}, 0.95)`;
+                midColor = `rgba(255, ${50 * State.alert.intensity}, 0, ${0.6 - State.alert.intensity * 0.1})`;
+                outerColor = `rgba(255, 0, 0, ${0.2 + State.alert.intensity * 0.1})`;
+            } else if (State.alert.type === 'green' && State.alert.intensity > 0) {
+                centerColor = `rgba(${150 + State.alert.intensity * 105}, 255, ${150 + State.alert.intensity * 105}, 0.95)`;
+                midColor = `rgba(0, 255, 100, ${0.5 + State.alert.intensity * 0.1})`;
+                outerColor = `rgba(0, 255, 100, ${0.15 + State.alert.intensity * 0.15})`;
+            } else {
+                centerColor = `rgba(${150 + (CONFIG.baseHue - 200)}, 230, 255, 0.95)`;
+                midColor = `hsla(${CONFIG.baseHue}, 100%, 50%, 0.5)`;
+                outerColor = `hsla(${CONFIG.baseHue}, 100%, 40%, 0.2)`;
+            }
+            
+            const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, r * 3);
+            gradient.addColorStop(0, centerColor);
+            gradient.addColorStop(0.15, midColor);
+            gradient.addColorStop(0.4, outerColor);
+            gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = gradient;
+            ctx.beginPath(); ctx.arc(centerX, centerY, r * 3, 0, Math.PI * 2); ctx.fill();
+        }
+
+        // Glitch artifacts overlay
+        function drawGlitchArtifacts() {
+            if (!State.glitch.active || CONFIG.glitchFactor <= 0) return;
+            const intensity = State.glitch.intensity;
+            
+            // Scanlines
+            ctx.fillStyle = `rgba(0, 255, 255, ${0.1 * intensity})`;
+            for (let i = 0; i < 5; i++) {
+                const y = (State.glitch.scanlineOffset + i * height / 5) % height;
+                ctx.fillRect(0, y, width, 2 * intensity);
+            }
+            
+            // RGB split blocks
+            if (intensity > 0.5) {
+                ctx.globalCompositeOperation = 'screen';
+                ctx.fillStyle = `rgba(0, 255, 255, ${0.1 * intensity})`;
+                ctx.fillRect(centerX - 100 * intensity, centerY - 100 * intensity, 200 * intensity, 200 * intensity);
+                ctx.fillStyle = `rgba(255, 0, 255, ${0.1 * intensity})`;
+                ctx.fillRect(centerX - 100 * intensity + 10, centerY - 100 * intensity, 200 * intensity, 200 * intensity);
+                ctx.globalCompositeOperation = 'source-over';
+            }
+            
+            // Random static blocks
+            ctx.fillStyle = `rgba(255, 255, 255, ${0.05 * intensity})`;
+            for (let i = 0; i < 10 * intensity; i++) {
+                ctx.fillRect(Math.random() * width, Math.random() * height, Math.random() * 100 * intensity, Math.random() * 5);
+            }
+        }
+
+        // Message display system
+        function updateMessage() {
+            if (!State.message.active) return;
+            
+            // Typewriter effect
+            if (State.message.progress < State.message.text.length) {
+                State.message.progress += 0.5 * CONFIG.typingSpeed;
+                State.message.displayText = State.message.text.substring(0, Math.floor(State.message.progress));
+                // Random glitch char during typing
+                if (Math.random() < 0.1 && State.message.progress < State.message.text.length) {
+                    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*';
+                    State.message.displayText += chars[Math.floor(Math.random() * chars.length)];
+                }
+            } else {
+                State.message.timer++;
+                if (State.message.timer > CONFIG.messageDuration) State.message.fadeOut = true;
+            }
+            
+            if (State.message.fadeOut) {
+                State.message.opacity -= 0.02;
+                if (State.message.opacity <= 0) State.message.active = false;
+            }
+            
+            // Cursor blink
+            State.message.cursorTimer++;
+            if (State.message.cursorTimer > 30) {
+                State.message.cursorVisible = !State.message.cursorVisible;
+                State.message.cursorTimer = 0;
+            }
+        }
+
+        function drawMessage() {
+            if (!State.message.active || State.message.opacity <= 0) return;
+            
+            ctx.save();
+            const x = centerX;
+            const y = height * 0.15;
+            
+            // Glow
+            ctx.shadowColor = '#00d2ff';
+            ctx.shadowBlur = 20 * State.message.opacity;
+            
+            // Brackets
+            ctx.strokeStyle = `rgba(0, 210, 255, ${0.3 * State.message.opacity})`;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            // Left
+            ctx.moveTo(x - 200, y - 30); ctx.lineTo(x - 220, y - 30);
+            ctx.lineTo(x - 220, y + 10); ctx.lineTo(x - 200, y + 10);
+            // Right
+            ctx.moveTo(x + 200, y - 30); ctx.lineTo(x + 220, y - 30);
+            ctx.lineTo(x + 220, y + 10); ctx.lineTo(x + 200, y + 10);
+            ctx.stroke();
+            
+            // Background
+            ctx.fillStyle = `rgba(0, 210, 255, ${0.1 * State.message.opacity})`;
+            ctx.fillRect(x - 210, y - 25, 420, 40);
+            
+            // Text
+            ctx.font = 'bold 28px Rajdhani, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillStyle = `rgba(255, 255, 255, ${State.message.opacity})`;
+            ctx.fillText(State.message.displayText, x, y);
+            
+            // Cursor
+            if (State.message.cursorVisible && State.message.opacity > 0.5) {
+                const textWidth = ctx.measureText(State.message.displayText).width;
+                ctx.fillStyle = `rgba(0, 210, 255, ${State.message.opacity})`;
+                ctx.fillRect(x + textWidth/2 + 5, y - 12, 3, 24);
+            }
+            
+            ctx.restore();
+        }
+
+        // Update functions
+        function updateAlertIntensity() {
+            if (!State.alert.active) { State.alert.intensity = 0; return; }
+            const elapsed = performance.now() - State.alert.startTime;
+            const progress = Math.min(elapsed / CONFIG.alertDuration, 1);
+            State.alert.intensity = Math.sin(progress * Math.PI);
+            if (progress >= 1) State.alert.active = false;
+        }
+
+        function updateGlitch() {
+            const g = CONFIG.glitchFactor;
+            if (g <= 0) { State.glitch.active = false; return; }
+            
+            if (!State.glitch.active) {
+                if (Math.random() < g * 0.02) {
+                    State.glitch.active = true;
+                    State.glitch.intensity = g * (0.5 + Math.random() * 0.5);
+                    State.glitch.timer = 10 + Math.random() * 30 * g;
+                }
+            } else {
+                State.glitch.timer--;
+                State.glitch.intensity *= 0.95;
+                if (State.glitch.timer <= 0) State.glitch.active = false;
+            }
+            State.glitch.scanlineOffset = (State.glitch.scanlineOffset + 5) % height;
+        }
+
+        function updateAttractors() {
+            State.attractors.forEach(a => {
+                a.angle += a.speed * CONFIG.orbitalSpeed;
+                a.x = centerX + Math.cos(a.angle) * a.radius * CONFIG.globalScale;
+                a.y = centerY + Math.sin(a.angle) * a.radius * CONFIG.globalScale;
+            });
+        }
+
+        // Animation loop
+        let time = 0;
+        function animate() {
+            time++;
+            
+            updateAlertIntensity();
+            updateGlitch();
+            updateAttractors();
+            updateMessage();
+            
+            const breatheBase = Math.sin(time * 0.015 * CONFIG.breathSpeed);
+            const breathe = 1 + breatheBase * CONFIG.breathAmp;
+            
+            // Clear
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+            ctx.fillRect(0, 0, width, height);
+            
+            ctx.globalCompositeOperation = 'screen';
+            
+            // Draw systems
+            drawCoreGlow(time, breathe);
+            coreGrid.update(time, breathe);
+            coreGrid.draw(ctx);
+            
+            particles.forEach(p => p.update(time, breathe));
+            drawConnections();
+            particles.forEach(p => p.draw(ctx));
+            
+            ctx.globalCompositeOperation = 'source-over';
+            
+            // Overlays
+            drawGlitchArtifacts();
+            drawMessage();
+            
+            requestAnimationFrame(animate);
+        }
+        animate();
+
+        /**
+         * EXTERNAL API - EXPOSED TO WINDOW
+         * Use these functions to control the system from external code
+         */
+
+        // Send a text message to display
+        window.transmitMessage = function(text) {
+            if (!text || typeof text !== 'string') return;
+            State.message.text = text.toUpperCase().substring(0, 40); // Max 40 chars
+            State.message.displayText = '';
+            State.message.active = true;
+            State.message.progress = 0;
+            State.message.timer = 0;
+            State.message.fadeOut = false;
+            State.message.opacity = 1;
+            State.message.cursorVisible = true;
+        };
+
+        // Trigger alert state
+        // type: 'red' for emergency, 'green' for success
+        window.triggerAlert = function(type) {
+            State.alert.active = true;
+            State.alert.type = type === 'green' ? 'green' : 'red';
+            State.alert.startTime = performance.now();
+            State.alert.intensity = 0;
+        };
+
+        // Update configuration programmatically
+        // configObject: object with any CONFIG keys (e.g., {orbitalSpeed: 2.0, breathAmp: 0.8})
+        window.updateConfig = function(configObject) {
+            Object.keys(configObject).forEach(key => {
+                if (CONFIG.hasOwnProperty(key)) {
+                    CONFIG[key] = configObject[key];
+                }
+            });
+            // If shape changed, reassign particles
+            if (configObject.particleShape) {
+                particles.forEach(p => p.assignShape());
+            }
+        };
+
+        // Listen for messages from the VS Code extension
+        const vscodeApi = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
+        window.addEventListener('message', (event) => {
+            const msg = event.data || {};
+            if (msg.type !== 'sugarState') return;
+            if (typeof msg.thinking === 'boolean') {
+                window.updateConfig({ warpFactor: msg.thinking ? 0.5 : 0.0 });
+            }
+            if (typeof msg.attractorStrength === 'number') {
+                const strength = Math.max(0, Math.min(3, msg.attractorStrength));
+                window.updateConfig({ attractorStrength: strength });
+            }
+            if (typeof msg.toolMessage === 'string' && msg.toolMessage.trim()) {
+                window.transmitMessage(msg.toolMessage);
+            }
+            if (msg.outcome === 'success') {
+                window.triggerAlert('green');
+            } else if (msg.outcome === 'failure') {
+                window.triggerAlert('red');
+            }
+        });
+
+        // Export config for reading
+        window.ORBITAL_CONFIG = CONFIG;
+    </script>
+</body>
+</html>

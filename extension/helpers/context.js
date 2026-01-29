@@ -405,5 +405,60 @@ module.exports = {
   isValueSymbol,
   isLikelyKeyword,
   collectOutgoingCallHierarchy,
-  normalizeCommentLines
+  normalizeCommentLines,
+  buildContextId,
+  normalizeContextEntry,
+  normalizeContextList,
+  buildChatContextBlock
 };
+
+function buildContextId() {
+  return `ctx_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function normalizeContextEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const normalized = { ...entry };
+  if (!normalized.id) normalized.id = buildContextId();
+  if (!normalized.kind) normalized.kind = normalized.content ? 'note' : 'selection';
+  return normalized;
+}
+
+function normalizeContextList(input) {
+  if (Array.isArray(input)) {
+    return input.map(normalizeContextEntry).filter(Boolean);
+  }
+  if (input && typeof input === 'object') {
+    const normalized = normalizeContextEntry(input);
+    return normalized ? [normalized] : [];
+  }
+  return [];
+}
+
+function buildChatContextBlock(contexts) {
+  const list = normalizeContextList(contexts);
+  if (!list.length) return '';
+  const blocks = [];
+  for (const ctx of list) {
+    const headerParts = [];
+    const title = ctx.title || ctx.filePath || ctx.kind || 'Context';
+    headerParts.push(`Context: ${title}`);
+    if (ctx.filePath) headerParts.push(`File: ${ctx.filePath}`);
+    if (ctx.languageId) headerParts.push(`Language: ${ctx.languageId}`);
+    if (ctx.selection) {
+      headerParts.push(`Selection: lines ${ctx.selection.startLine}-${ctx.selection.endLine}`);
+    }
+    const blockParts = [...headerParts];
+    if (ctx.code && String(ctx.code).trim()) {
+      blockParts.push('Selected code:', String(ctx.code).trim());
+    }
+    if (ctx.extraContext && String(ctx.extraContext).trim()) {
+      blockParts.push('Additional context:', String(ctx.extraContext).trim());
+    }
+    if (ctx.content && String(ctx.content).trim()) {
+      blockParts.push('Notes:', String(ctx.content).trim());
+    }
+    blocks.push(blockParts.join('\n'));
+  }
+  return blocks.join('\n\n');
+}
