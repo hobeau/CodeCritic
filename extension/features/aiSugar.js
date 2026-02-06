@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 
-let aiSugarPanel;
+/** @type {vscode.WebviewView | undefined} */
+let aiSugarView;
 let aiSugarState = { thinking: false, outcome: null, toolMessage: '', attractorStrength: 0 };
 
 async function buildAiSugarHtml(webview, extensionUri) {
@@ -13,9 +14,9 @@ async function buildAiSugarHtml(webview, extensionUri) {
 }
 
 function postAiSugarState() {
-  if (!aiSugarPanel) return;
+  if (!aiSugarView) return;
   try {
-    aiSugarPanel.webview.postMessage({ type: 'sugarState', ...aiSugarState });
+    aiSugarView.webview.postMessage({ type: 'sugarState', ...aiSugarState });
   } catch {
     // Ignore webview dispatch errors so chat flow doesn't break.
   }
@@ -28,29 +29,34 @@ function updateAiSugarState(next) {
 
 function registerAiSugarFeature({ context }) {
   context.subscriptions.push(
-    vscode.commands.registerCommand('codeCritic.showAiSugar', async () => {
-      if (aiSugarPanel) {
-        aiSugarPanel.reveal(vscode.ViewColumn.Beside);
-        postAiSugarState();
-        return;
-      }
+    vscode.window.registerWebviewViewProvider(
+      'codeCritic.aiSugarView',
+      {
+        async resolveWebviewView(view) {
+          aiSugarView = view;
 
-      aiSugarPanel = vscode.window.createWebviewPanel(
-        'codeCritic.aiSugar',
-        'AI Sugar',
-        vscode.ViewColumn.Beside,
-        {
-          enableScripts: true,
-          retainContextWhenHidden: true,
-          localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'views')]
+          view.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'views')]
+          };
+
+          view.webview.html = await buildAiSugarHtml(view.webview, context.extensionUri);
+
+          view.onDidDispose(() => {
+            aiSugarView = undefined;
+          });
+
+          postAiSugarState();
         }
-      );
+      },
+      { webviewOptions: { retainContextWhenHidden: true } }
+    )
+  );
 
-      aiSugarPanel.onDidDispose(() => {
-        aiSugarPanel = undefined;
-      });
-
-      aiSugarPanel.webview.html = await buildAiSugarHtml(aiSugarPanel.webview, context.extensionUri);
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codeCritic.showAiSugar', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.codeCritic');
+      await vscode.commands.executeCommand('codeCritic.aiSugarView.focus');
       postAiSugarState();
     })
   );

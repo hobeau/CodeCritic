@@ -51,9 +51,181 @@
       color: var(--fg);
       padding: 6px 10px;
     }
-    select.thread-select {
-      min-width: 160px;
-      max-width: 240px;
+    .thread-picker {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      position: relative;
+    }
+    .thread-label {
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .thread-control {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    button.thread-trigger {
+      min-width: 200px;
+      max-width: 280px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 12px;
+      background: linear-gradient(120deg, rgba(120, 140, 180, 0.12), rgba(30, 40, 60, 0.16)), var(--panel);
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    button.thread-trigger:focus {
+      outline: 2px solid rgba(120, 160, 255, 0.35);
+      outline-offset: 1px;
+    }
+    .thread-title {
+      flex: 1;
+      min-width: 0;
+      text-align: left;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .thread-chevron {
+      font-size: 12px;
+      opacity: 0.6;
+      transition: transform 120ms ease;
+    }
+    button.thread-trigger[aria-expanded="true"] .thread-chevron {
+      transform: rotate(180deg);
+    }
+    .thread-dropdown {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      width: min(320px, 84vw);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px;
+      display: none;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
+      z-index: 20;
+    }
+    .thread-dropdown.is-open {
+      display: block;
+    }
+    .thread-search {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      margin-bottom: 6px;
+    }
+    .thread-search input {
+      flex: 1;
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: rgba(0, 0, 0, 0.12);
+      color: var(--fg);
+      padding: 6px 10px;
+      min-width: 0;
+    }
+    .thread-search input:focus {
+      outline: 2px solid rgba(120, 160, 255, 0.25);
+      outline-offset: 1px;
+    }
+    button.icon.small {
+      width: 24px;
+      height: 24px;
+      font-size: 12px;
+    }
+    .thread-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-height: 240px;
+      overflow: auto;
+    }
+    .thread-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      transition: background 120ms ease, border-color 120ms ease;
+      position: relative;
+    }
+    .thread-row:hover {
+      background: rgba(120, 140, 180, 0.12);
+    }
+    .thread-row.is-active {
+      border-color: rgba(120, 160, 255, 0.4);
+      background: rgba(120, 160, 255, 0.12);
+    }
+    .thread-item {
+      flex: 1;
+      min-width: 0;
+      border: none;
+      background: transparent;
+      color: var(--fg);
+      text-align: left;
+      font-size: 12px;
+      padding: 0;
+      padding-right: 8px;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .thread-item:disabled {
+      cursor: default;
+    }
+    .thread-delete {
+      flex-shrink: 0;
+      border: none;
+      background: rgba(255, 80, 80, 0.12);
+      color: var(--danger);
+      border-radius: 8px;
+      width: 26px;
+      height: 26px;
+      min-width: 26px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: bold;
+      cursor: pointer;
+      position: relative;
+      z-index: 10;
+      margin-left: auto;
+    }
+    .thread-delete:hover {
+      background: rgba(255, 80, 80, 0.3);
+      transform: scale(1.05);
+    }
+    .thread-delete:active {
+      transform: scale(0.95);
+    }
+    .thread-delete:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    .thread-empty {
+      display: none;
+      text-align: center;
+      font-size: 11px;
+      color: var(--muted);
+      padding: 10px 0;
+    }
+    .thread-empty.is-visible {
+      display: block;
     }
     select.model-select {
       min-width: 160px;
@@ -241,7 +413,7 @@
       border: none;
       text-align: left;
     }
-    /* Todos kept for backwards compatibility but using inline approvals now */
+    /* Plan panel (legacy todo styles retained for compatibility) */
     .todos {
       padding: 12px 16px 0;
       display: flex;
@@ -303,6 +475,139 @@
       font-size: 10px;
       color: var(--fg);
       background: rgba(0, 0, 0, 0.2);
+    }
+    .markdown-plan {
+      background: linear-gradient(145deg, rgba(60, 100, 180, 0.08), rgba(30, 40, 60, 0.12));
+    }
+    .markdown-plan-content {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--fg);
+    }
+    .markdown-plan-content h1,
+    .markdown-plan-content h2,
+    .markdown-plan-content h3 {
+      margin: 16px 0 8px;
+      font-weight: 600;
+    }
+    .markdown-plan-content h1 { font-size: 15px; }
+    .markdown-plan-content h2 { font-size: 14px; }
+    .markdown-plan-content h3 { font-size: 13px; }
+    .markdown-plan-content .checkbox {
+      padding: 4px 0;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .markdown-plan-content .checkbox .check {
+      display: inline-block;
+      min-width: 16px;
+      text-align: center;
+      font-size: 14px;
+    }
+    .markdown-plan-content .checkbox.checked {
+      color: var(--success);
+      text-decoration: line-through;
+    }
+    .markdown-plan-content code {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'Monaco', 'Courier New', monospace;
+      font-size: 12px;
+    }
+    .markdown-plan-content ul {
+      margin: 8px 0;
+      padding-left: 20px;
+    }
+    .awaiting-input {
+      background: linear-gradient(145deg, rgba(255, 180, 60, 0.12), rgba(255, 120, 40, 0.08));
+      border-color: var(--warning);
+    }
+    .awaiting-input-content {
+      padding: 12px;
+      border-left: 3px solid var(--warning);
+      margin: 8px 0;
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--fg);
+    }
+    .execution-plan-collapsible {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: linear-gradient(145deg, rgba(60, 100, 180, 0.05), rgba(30, 40, 60, 0.08));
+      margin: 12px 0;
+      overflow: hidden;
+    }
+    .execution-plan-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      cursor: pointer;
+      background: rgba(60, 100, 180, 0.1);
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      user-select: none;
+    }
+    .execution-plan-header:hover {
+      background: rgba(60, 100, 180, 0.15);
+    }
+    .execution-plan-collapsible[open] .plan-toggle {
+      transform: rotate(180deg);
+    }
+    .plan-toggle {
+      margin-left: auto;
+      transition: transform 0.2s ease;
+      font-size: 12px;
+    }
+    .plan-icon {
+      font-size: 16px;
+    }
+    .plan-title {
+      flex: 1;
+      font-size: 14px;
+    }
+    .execution-plan-content {
+      padding: 16px;
+      max-height: 400px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .execution-plan-content h1,
+    .execution-plan-content h2,
+    .execution-plan-content h3 {
+      margin: 16px 0 8px;
+      font-weight: 600;
+    }
+    .execution-plan-content h1 { font-size: 15px; }
+    .execution-plan-content h2 { font-size: 14px; }
+    .execution-plan-content h3 { font-size: 13px; }
+    .execution-plan-content ul,
+    .execution-plan-content ol {
+      margin: 8px 0;
+      padding-left: 24px;
+    }
+    .execution-plan-content li {
+      margin: 4px 0;
+    }
+    .execution-plan-content code {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'Monaco', 'Courier New', monospace;
+      font-size: 12px;
+    }
+    .execution-plan-content pre {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 12px;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .execution-plan-message {
+      max-width: 95%;
     }
     .context-form {
       border-top: 1px solid var(--border);
@@ -939,9 +1244,25 @@
 <body>
   <header>
     <div class="controls">
-      <label for="threadSelect">Chat</label>
-      <select id="threadSelect" class="thread-select"></select>
-      <button id="newChat" class="icon" title="New chat">+</button>
+      <div class="thread-picker">
+        <label class="thread-label" for="threadSearch">History</label>
+        <div class="thread-control">
+          <button id="threadTrigger" class="thread-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+            <span id="threadTitle" class="thread-title">Loading...</span>
+            <span class="thread-chevron">v</span>
+          </button>
+          <button id="newChat" class="icon" title="New chat">+</button>
+          <button id="deleteChat" class="icon danger" title="Delete current chat">×</button>
+        </div>
+        <div id="threadDropdown" class="thread-dropdown" role="dialog" aria-hidden="true">
+          <div class="thread-search">
+            <input id="threadSearch" type="text" placeholder="Search chats..." />
+            <button id="threadClear" class="icon small" title="Clear search">X</button>
+          </div>
+          <div id="threadList" class="thread-list" role="listbox"></div>
+          <div id="threadEmpty" class="thread-empty">No chats found</div>
+        </div>
+      </div>
     </div>
   </header>
   <div class="tabs">
@@ -950,7 +1271,7 @@
   </div>
   
   <section id="tabChat" class="tab-panel active">
-    <!-- Todos kept for backwards compatibility -->
+    <!-- Plan panel (legacy todo styles retained for compatibility) -->
     <div id="todos" class="todos"></div>
     
     <!-- Approvals now rendered inline within tool blocks below -->

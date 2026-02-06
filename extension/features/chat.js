@@ -1,19 +1,17 @@
 const vscode = require('vscode');
 const path = require('path');
-let sqlite3;
-try {
-  sqlite3 = require('sqlite3');
-} catch {
-  sqlite3 = null;
-}
 
 const {
   isDebugEnabled,
   getMethodReviewConfig,
   getChatHistoryCharLimit,
   getAgentMaxSteps,
+  getAgentPrePlanMaxSteps,
+  getChatMaxSteps,
   isAgentMemoryEnabled,
-  getAgentMemoryCharLimit
+  getAgentMemoryCharLimit,
+  getDebugLoopMaxIterations,
+  shouldSkipFeatureMapping
 } = require('../helpers/config');
 const { getOutputChannel, updateTokenEstimate } = require('../helpers/output');
 const { buildMethodDependencyContext, updateSelectionContextsForEdit, buildChatContextBlock, normalizeContextList, normalizeContextEntry, buildContextId } = require('../helpers/context');
@@ -22,6 +20,25 @@ const { safeJsonParse, extractFirstJsonPayload, extractAssistantText, postChatCo
 const { createToolRunner, limitToolOutput } = require('../tools/agentTools');
 const { updateAiSugarState } = require('./aiSugar');
 const { buildSystemPrompt, CHAT_TOOL_NAMES, AGENT_TOOL_NAMES } = require('../helpers/prompts');
+const { ChatDatabase } = require('../helpers/chatDb');
+
+// Import agent utilities (parsing, tool utils, plan utils, ReAct utilities)
+const {
+  parseAgentResponse,
+  parseTaggedToolCalls,
+  extractToolCallsFromText,
+  extractLooseToolCalls
+} = require('./agent/utils/parsing');
+const {
+  normalizeToolCall,
+  formatToolResultForUi
+} = require('./agent/utils/toolUtils');
+const {
+  mergePlanLists
+} = require('./agent/utils/planUtils');
+// ReAct + Evidence Ladder utilities
+const { discoverTestCommand, parseTestOutput } = require('./agent/utils/testUtils');
+const { discoverBuildCommand, parseBuildOutput } = require('./agent/utils/buildUtils');
 
 
 /** @type {vscode.ExtensionContext | undefined} */
@@ -31,23 +48,22 @@ let chatView;
 let chatViewInitialized = false;
 /** @type {vscode.WebviewPanel | undefined} */
 let htmlPreviewPanel;
-/** @type {{ mode: 'chat'|'planner'|'agent', contexts: any[], messages: Array<{ role: 'user'|'assistant', content: string }>, todos: any[], plan: any[], approvals: any[], model?: string }} */
-let chatState = { mode: 'chat', contexts: [], messages: [], todos: [], plan: [], approvals: [], model: '' };
+/** @type {{ mode: 'chat'|'planner'|'agent', contexts: any[], messages: Array<{ role: 'user'|'assistant', content: string }>, modelMessages?: Array<{ role: 'user'|'assistant', content: string }>, plan: any[], approvals: any[], model?: string, markdownPlan?: string, awaitingHumanInput?: boolean, pendingQuestion?: string }} */
+let chatState = { mode: 'chat', contexts: [], messages: [], modelMessages: [], plan: [], approvals: [], model: '' };
 let chatBusy = false;
-/** @type {import('sqlite3').Database | undefined} */
-let chatDb;
-/** @type {Promise<void> | undefined} */
-let chatDbReady;
+const chatDatabase = new ChatDatabase();
 /** @type {Array<{ id: string, title: string, updatedAt: string }>} */
 let chatThreads = [];
+/** @type {string} */
+let chatThreadFilter = '';
+/** @type {Array<{ id: string, title: string, updatedAt: string }> | null} */
+let chatThreadResults = null;
 /** @type {string | null} */
 let activeChatThreadId = null;
-let chatDbUnavailable = false;
 let chatWebviewReady = false;
 let toolRunner;
 const pendingApprovals = new Map();
 const approvalQueue = [];
-let todoSeedCache = null;
 let stopRequested = false;
 let activeAbortController = null;
 let agentContinuationMessages = null;
@@ -55,6 +71,8 @@ let lastDebugStackItem = null;
 let lastDebugSession = null;
 let debugListenEnabled = false;
 const DEBUG_CONTEXT_ID = 'debug_snapshot_live';
+const recentEdits = new Map();
+const EDIT_COOLDOWN_MS = 5000;
 const AGENT_MEMORY_CONTEXT_ID = 'agent_memory_summary';
 const AGENT_MEMORY_TITLE = 'Agent Memory';
 let chatModelOptions = [];
@@ -231,17 +249,26 @@ function sendToChatWebview(payload) {
   }
 }
 
-function requestChatApproval({ title, details, approveLabel, cancelLabel }) {
+function requestChatApproval({ title, details, approveLabel, cancelLabel, messageIndex }) {
   return new Promise((resolve) => {
+    // Skip approvals in agent mode - agent should proceed automatically
+    if (chatState.mode === 'agent') {
+      resolve(true);
+      return;
+    }
+    
     const id = `approve_${Date.now()}_${Math.random().toString(16).slice(2)}`;
     pendingApprovals.set(id, { resolve });
+    // Default to the last message index if not specified
+    const actualIndex = typeof messageIndex === 'number' ? messageIndex : Math.max(0, chatState.messages.length - 1);
     const payload = {
       type: 'approval',
       id,
       title: String(title || 'Approve action'),
       details,
       approveLabel: approveLabel || 'Approve',
-      cancelLabel: cancelLabel || 'Cancel'
+      cancelLabel: cancelLabel || 'Cancel',
+      messageIndex: actualIndex
     };
     chatState.approvals = [
       ...(Array.isArray(chatState.approvals) ? chatState.approvals.filter((item) => String(item.id) !== id) : []),
@@ -281,6 +308,15 @@ function flushApprovalQueue() {
 function registerChatFeature({ context, threadState }) {
   extensionContext = context;
   loadChatModelPrefs();
+
+  // Initialize database
+  chatDatabase.initialize(context).then((storedId) => {
+    if (storedId) {
+      activeChatThreadId = storedId;
+    }
+  }).catch((err) => {
+    vscode.window.showErrorMessage(`CodeCritic: Failed to initialize chat database. ${String(err.message || err)}`);
+  });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('codeCritic.openChat', async () => {
@@ -370,14 +406,7 @@ function registerChatFeature({ context, threadState }) {
 
   context.subscriptions.push({
     dispose: () => {
-      if (chatDb) {
-        try {
-          chatDb.close();
-        } catch {
-          // ignore
-        }
-        chatDb = undefined;
-      }
+      chatDatabase.dispose();
     }
   });
 
@@ -470,20 +499,173 @@ async function setChatContext(context, options) {
 }
 
 function buildChatViewState() {
+  const viewThreads = chatThreadFilter ? (chatThreadResults || []) : chatThreads;
   return {
     mode: chatState.mode,
     contexts: chatState.contexts,
-    todos: chatState.todos,
     plan: chatState.plan,
     approvals: chatState.approvals,
     messages: chatState.messages,
     busy: chatBusy,
-    threads: chatThreads,
+    threads: viewThreads,
+    threadsFiltered: Boolean(chatThreadFilter),
+    threadsTotal: chatThreads.length,
+    threadFilter: chatThreadFilter,
     activeThreadId: activeChatThreadId,
+    activeThreadTitle: chatDatabase.getActiveThreadTitle(activeChatThreadId, chatThreads, chatThreadResults),
     debugListenEnabled,
     models: getChatModelOptions(),
-    activeModel: getActiveChatModel()
+    activeModel: getActiveChatModel(),
+    awaitingHumanInput: chatState.awaitingHumanInput || false,
+    pendingQuestion: chatState.pendingQuestion || null,
+    markdownPlan: chatState.markdownPlan || null
   };
+}
+
+async function ensureChatReady() {
+  await chatDatabase.ensureReady();
+  
+  chatThreads = await chatDatabase.refreshThreads();
+  
+  if (!activeChatThreadId || !chatThreads.find((t) => t.id === activeChatThreadId)) {
+    const first = chatThreads[0];
+    activeChatThreadId = first ? first.id : null;
+  }
+  
+  if (!activeChatThreadId) {
+    const title = chatDatabase.defaultChatTitle();
+    activeChatThreadId = await chatDatabase.createThread({ title, context: null, plan: [] });
+  }
+  
+  if (activeChatThreadId) {
+    const threadData = await chatDatabase.loadThread(activeChatThreadId);
+    if (threadData) {
+      chatState.messages = threadData.messages;
+      chatState.contexts = threadData.contexts;
+      chatState.plan = threadData.plan;
+      chatState.approvals = [];
+    }
+    await chatDatabase.persistActiveThreadId(extensionContext, activeChatThreadId);
+  }
+}
+
+async function refreshChatThreads() {
+  chatThreads = await chatDatabase.refreshThreads();
+  
+  if (chatThreadFilter) {
+    try {
+      chatThreadResults = await chatDatabase.queryThreadsByFilter(chatThreadFilter);
+    } catch (err) {
+      const out = getOutputChannel();
+      out.appendLine(`CodeCritic thread filter refresh failed: ${String(err && err.message ? err.message : err)}`);
+      out.show(true);
+      chatThreadResults = [];
+    }
+  } else {
+    chatThreadResults = null;
+  }
+}
+
+async function createChatThread({ title, context, plan }) {
+  const id = await chatDatabase.createThread({ title, context, plan });
+  if (id) {
+    activeChatThreadId = id;
+    await chatDatabase.persistActiveThreadId(extensionContext, activeChatThreadId);
+  }
+  await refreshChatThreads();
+  return id;
+}
+
+async function loadChatThread(threadId) {
+  const threadData = await chatDatabase.loadThread(threadId);
+  if (!threadData) return;
+  
+  chatState.messages = threadData.messages;
+  chatState.contexts = threadData.contexts;
+  chatState.plan = threadData.plan;
+  chatState.approvals = [];
+}
+
+async function selectChatThread(threadId) {
+  await ensureChatReady();
+  const normId = chatDatabase.normalizeThreadId(threadId);
+  if (!normId) return;
+  
+  activeChatThreadId = normId;
+  await chatDatabase.persistActiveThreadId(extensionContext, activeChatThreadId);
+  await loadChatThread(normId);
+  postChatState();
+}
+
+async function deleteChatThread(threadId) {
+  await chatDatabase.deleteThread(threadId);
+  
+  const normId = chatDatabase.normalizeThreadId(threadId);
+  if (activeChatThreadId === normId) {
+    activeChatThreadId = null;
+  }
+  
+  await refreshChatThreads();
+  
+  if (!activeChatThreadId || !chatThreads.find((t) => t.id === activeChatThreadId)) {
+    const first = chatThreads[0];
+    activeChatThreadId = first ? first.id : null;
+  }
+  
+  if (!activeChatThreadId) {
+    const title = chatDatabase.defaultChatTitle();
+    activeChatThreadId = await createChatThread({ title, context: null, plan: [] });
+  }
+  
+  if (activeChatThreadId) {
+    await loadChatThread(activeChatThreadId);
+    await chatDatabase.persistActiveThreadId(extensionContext, activeChatThreadId);
+  }
+}
+
+async function clearChatMessages(threadId) {
+  await chatDatabase.clearMessages(threadId);
+}
+
+async function updateChatThreadContext(threadId, context) {
+  await chatDatabase.updateThreadContext(threadId, context);
+}
+
+async function updateChatThreadPlan(threadId, plan) {
+  await chatDatabase.updateThreadPlan(threadId, plan);
+}
+
+async function touchChatThread(threadId) {
+  await chatDatabase.touchThread(threadId);
+}
+
+async function addChatMessage(threadId, role, content) {
+  await chatDatabase.addMessage(threadId, role, content);
+}
+
+async function maybeUpdateThreadTitleFromMessage(threadId, message) {
+  await chatDatabase.maybeUpdateThreadTitle(threadId, message);
+}
+
+async function applyThreadFilter(query) {
+  chatThreadFilter = String(query || '').trim();
+  if (!chatThreadFilter) {
+    chatThreadResults = null;
+    return;
+  }
+  try {
+    chatThreadResults = await chatDatabase.queryThreadsByFilter(chatThreadFilter);
+  } catch (err) {
+    const out = getOutputChannel();
+    out.appendLine(`CodeCritic thread filter failed: ${String(err && err.message ? err.message : err)}`);
+    out.show(true);
+    chatThreadResults = [];
+  }
+}
+
+async function persistActiveChatThreadId() {
+  if (!extensionContext) return;
+  await chatDatabase.persistActiveThreadId(extensionContext, activeChatThreadId);
 }
 
 function postChatState() {
@@ -562,19 +744,8 @@ async function handleChatMessage(msg) {
 
   if (msg.type === 'setMode') {
     if (msg.mode === 'chat' || msg.mode === 'planner' || msg.mode === 'agent') {
-      const prevMode = chatState.mode;
       chatState.mode = msg.mode;
       setAgentContinuation(null);
-      if (prevMode === 'planner' && msg.mode === 'agent') {
-        const seeded = seedTodosFromPlan(chatState.plan);
-        if (seeded.length) {
-          await setTodoList(seeded);
-          todoSeedCache = seeded;
-        } else {
-          await setTodoList([]);
-          todoSeedCache = null;
-        }
-      }
       postChatState();
     }
     return;
@@ -614,35 +785,134 @@ async function handleChatMessage(msg) {
     }
 
   if (msg.type === 'clearTodos') {
-    if (chatState.mode === 'agent') {
-      chatState.todos = [];
-      todoSeedCache = null;
-      if (activeChatThreadId) {
-        await updateChatThreadTodos(activeChatThreadId, []);
-        await touchChatThread(activeChatThreadId);
-      }
-    } else {
-      chatState.plan = [];
-      if (activeChatThreadId) {
-        await updateChatThreadPlan(activeChatThreadId, []);
-        await touchChatThread(activeChatThreadId);
-      }
+    chatState.plan = [];
+    chatState.markdownPlan = null;
+    if (activeChatThreadId) {
+      await updateChatThreadPlan(activeChatThreadId, []);
+      await touchChatThread(activeChatThreadId);
     }
     postChatState();
+    return;
+  }
+
+  if (msg.type === 'togglePlanItemStatus') {
+    const itemId = String(msg.itemId || '');
+    if (itemId && chatState.mode === 'planner') {
+      chatState.plan = chatState.plan.map(item => {
+        if (item.id === itemId) {
+          return { ...item, status: item.status === 'done' ? 'pending' : 'done' };
+        }
+        return item;
+      });
+      if (activeChatThreadId) {
+        await updateChatThreadPlan(activeChatThreadId, chatState.plan);
+        await touchChatThread(activeChatThreadId);
+      }
+      postChatState();
+    }
+    return;
+  }
+
+  if (msg.type === 'updatePlanItem') {
+    const itemId = String(msg.itemId || '');
+    const newText = String(msg.text || '').trim();
+    if (itemId && newText && chatState.mode === 'planner') {
+      chatState.plan = chatState.plan.map(item => {
+        if (item.id === itemId) {
+          return { ...item, text: newText };
+        }
+        return item;
+      });
+      if (activeChatThreadId) {
+        await updateChatThreadPlan(activeChatThreadId, chatState.plan);
+        await touchChatThread(activeChatThreadId);
+      }
+      postChatState();
+    }
+    return;
+  }
+
+  if (msg.type === 'deletePlanItem') {
+    const itemId = String(msg.itemId || '');
+    if (itemId && chatState.mode === 'planner') {
+      chatState.plan = chatState.plan.filter(item => item.id !== itemId);
+      if (activeChatThreadId) {
+        await updateChatThreadPlan(activeChatThreadId, chatState.plan);
+        await touchChatThread(activeChatThreadId);
+      }
+      postChatState();
+    }
+    return;
+  }
+
+  if (msg.type === 'addPlanItem') {
+    const text = String(msg.text || '').trim();
+    if (text && chatState.mode === 'planner') {
+      const maxId = chatState.plan.reduce((max, item) => {
+        const num = parseInt(item.id.replace(/\D/g, ''), 10);
+        return !isNaN(num) && num > max ? num : max;
+      }, 0);
+      const newItem = {
+        id: `plan_${maxId + 1}`,
+        text,
+        status: 'pending'
+      };
+      chatState.plan = [...chatState.plan, newItem];
+      if (activeChatThreadId) {
+        await updateChatThreadPlan(activeChatThreadId, chatState.plan);
+        await touchChatThread(activeChatThreadId);
+      }
+      postChatState();
+    }
     return;
   }
 
   if (msg.type === 'newThread') {
     await ensureChatReady();
     setAgentContinuation(null);
-    const newId = await createChatThread({ title: defaultChatTitle(), context: null, todos: [], plan: [] });
+    const title = chatDatabase.defaultChatTitle();
+    const newId = await createChatThread({ title, context: null, plan: [] });
     if (newId) {
       await loadChatThread(newId);
-      await persistActiveChatThreadId();
     }
     if (debugListenEnabled) {
       await refreshDebugSnapshot();
     }
+    postChatState();
+    return;
+  }
+
+  if (msg.type === 'confirmDeleteThread') {
+    const threadTitle = msg.threadTitle || 'this chat';
+    const result = await vscode.window.showWarningMessage(
+      `Delete "${threadTitle}"?`,
+      { modal: true },
+      'Delete'
+    );
+    if (result === 'Delete') {
+      await ensureChatReady();
+      await deleteChatThread(msg.threadId);
+      if (debugListenEnabled) {
+        await refreshDebugSnapshot();
+      }
+      postChatState();
+    }
+    return;
+  }
+
+  if (msg.type === 'deleteThread') {
+    await ensureChatReady();
+    await deleteChatThread(msg.threadId);
+    if (debugListenEnabled) {
+      await refreshDebugSnapshot();
+    }
+    postChatState();
+    return;
+  }
+
+  if (msg.type === 'filterThreads') {
+    await ensureChatReady();
+    await applyThreadFilter(msg.query);
     postChatState();
     return;
   }
@@ -855,30 +1125,31 @@ async function handleChatMessage(msg) {
     const text = String(msg.text || '').trim();
     if (!text) return;
     if (chatBusy) return;
-    const isContinuation = isContinuationRequest(text);
+    
+    // Check if agent is awaiting human input
+    const isRespondingToAgent = chatState.awaitingHumanInput && agentContinuationMessages;
+    
+    const isContinuation = isContinuationRequest(text) || isRespondingToAgent;
     const continuationMessages = isContinuation ? agentContinuationMessages : null;
     if (!isContinuation) {
       setAgentContinuation(null);
     }
+    
+    // Clear awaiting human input state when user responds
+    if (isRespondingToAgent) {
+      chatState.awaitingHumanInput = false;
+      chatState.pendingQuestion = null;
+    }
+    
     stopRequested = false;
     await ensureChatReady();
-    if (chatState.mode === 'agent') {
-      const seeded = seedTodosFromPrompt(text);
-      if (seeded && seeded.length) {
-        await applyTodoUpdate(seeded);
-        todoSeedCache = seeded;
-      } else {
-        todoSeedCache = null;
-      }
-    }
-    if (!activeChatThreadId && chatDb) {
+    if (!activeChatThreadId) {
+      const title = chatDatabase.defaultChatTitle();
       activeChatThreadId = await createChatThread({
-        title: defaultChatTitle(),
+        title,
         context: chatState.contexts,
-        todos: chatState.todos,
         plan: chatState.plan
       });
-      await persistActiveChatThreadId();
     }
     chatBusy = true;
     let sugarOutcome = 'success';
@@ -905,10 +1176,11 @@ async function handleChatMessage(msg) {
         const debugCmd = parseDebuggerCommand(text);
         const searchCmd = !debugCmd ? parseSearchCommand(text) : null;
         const symbolsCmd = !debugCmd && !searchCmd ? parseSymbolsCommand(text) : null;
-        const commandType = debugCmd ? 'debugger' : (searchCmd ? 'search' : (symbolsCmd ? 'symbols' : ''));
+        const problemsCmd = !debugCmd && !searchCmd && !symbolsCmd ? parseProblemsCommand(text) : null;
+        const commandType = debugCmd ? 'debugger' : (searchCmd ? 'search' : (symbolsCmd ? 'symbols' : (problemsCmd ? 'problems' : '')));
         const commandQuery = debugCmd
           ? debugCmd.query
-          : (searchCmd ? searchCmd.query : (symbolsCmd ? symbolsCmd.query : ''));
+          : (searchCmd ? searchCmd.query : (symbolsCmd ? symbolsCmd.query : (problemsCmd ? problemsCmd.query : '')));
 
         const commandMessages = [];
         if (debugCmd) {
@@ -920,6 +1192,9 @@ async function handleChatMessage(msg) {
         } else if (symbolsCmd) {
           const symbolsPayload = await buildSymbolsContextMessage(symbolsCmd.query);
           commandMessages.push({ role: 'assistant', content: symbolsPayload });
+        } else if (problemsCmd) {
+          const problemsPayload = await buildProblemsContextMessage();
+          commandMessages.push({ role: 'assistant', content: problemsPayload });
         }
 
         const baseWithTools = commandMessages.length ? [...baseMessages, ...commandMessages] : baseMessages;
@@ -940,7 +1215,7 @@ async function handleChatMessage(msg) {
           ? 'Analyze the current debugger context.'
           : (commandType === 'search'
             ? 'Use the search results above.'
-            : (commandType === 'symbols' ? 'Use the symbol search results above.' : ''));
+            : (commandType === 'symbols' ? 'Use the symbol search results above.' : (commandType === 'problems' ? 'Analyze and help fix these errors.' : '')));
         let modelSeed = [];
         if (continuationMessages && continuationMessages.length) {
           const userForModel = commandType
@@ -992,195 +1267,28 @@ async function handleChatMessage(msg) {
           await refreshChatThreads();
         }
       } else {
-        setAgentContinuation(null);
-        const debugCmd = parseDebuggerCommand(text);
-        const searchCmd = !debugCmd ? parseSearchCommand(text) : null;
-        const symbolsCmd = !debugCmd && !searchCmd ? parseSymbolsCommand(text) : null;
-        const commandType = debugCmd ? 'debugger' : (searchCmd ? 'search' : (symbolsCmd ? 'symbols' : ''));
-        const commandQuery = debugCmd
-          ? debugCmd.query
-          : (searchCmd ? searchCmd.query : (symbolsCmd ? symbolsCmd.query : ''));
-
-        const commandMessages = [];
-        if (debugCmd) {
-          const debuggerPayload = await buildDebuggerContextMessage(debugCmd.sessionFilter);
-          commandMessages.push({ role: 'assistant', content: debuggerPayload });
-        } else if (searchCmd) {
-          const searchPayload = await buildSearchContextMessage(searchCmd.query);
-          commandMessages.push({ role: 'assistant', content: searchPayload });
-        } else if (symbolsCmd) {
-          const symbolsPayload = await buildSymbolsContextMessage(symbolsCmd.query);
-          commandMessages.push({ role: 'assistant', content: symbolsPayload });
+        // Chat or Planner mode - use strategy pattern
+        const beforeCount = baseMessages.length;
+        let status;
+        
+        if (chatState.mode === 'chat') {
+          status = await runChatTurn(baseMessages, text, threadId);
+        } else if (chatState.mode === 'planner') {
+          status = await runPlannerTurn(baseMessages, text, threadId);
         }
-
-        const smartSearchMessages = commandType ? [] : await buildSmartSearchMessages(text);
-        const toolMessages = commandMessages.length || smartSearchMessages.length
-          ? [...commandMessages, ...smartSearchMessages]
-          : [];
-        const baseWithTools = toolMessages.length ? [...baseMessages, ...toolMessages] : baseMessages;
-        if (toolMessages.length) {
-          chatState.messages = baseWithTools;
-          postChatState();
-          if (threadId) {
-            for (const toolMsg of toolMessages) {
-              await addChatMessage(threadId, 'assistant', toolMsg.content);
-            }
-            await touchChatThread(threadId);
-            await refreshChatThreads();
-          }
+        
+        if (status === 'failure') {
+          markSugarFailure();
+        } else if (status === 'stopped') {
+          markSugarStopped();
         }
-
-        const historyLimit = getChatHistoryCharLimit();
-        const defaultQuery = commandType === 'debugger'
-          ? 'Analyze the current debugger context.'
-          : (commandType === 'search'
-            ? 'Use the search results above.'
-            : (commandType === 'symbols' ? 'Use the symbol search results above.' : ''));
-        const modelInput = commandType
-          ? (() => {
-            const cloned = [...baseWithTools];
-            const userIndex = baseWithTools.length - toolMessages.length - 1;
-            if (userIndex >= 0 && cloned[userIndex] && cloned[userIndex].role === 'user') {
-              cloned[userIndex] = {
-                ...cloned[userIndex],
-                content: commandQuery || defaultQuery
-              };
-            }
-            if (commandMessages.length) {
-              const commandSet = new Set(commandMessages.map((msg) => msg.content));
-              const withoutCommand = cloned.filter(
-                (msg) => !(msg && msg.role === 'assistant' && commandSet.has(msg.content))
-              );
-              return [...commandMessages, ...withoutCommand];
-            }
-            return cloned;
-          })()
-          : baseWithTools;
-        const maxSteps = Math.max(3, Math.min(6, getAgentMaxSteps()));
-        let modelTrace = [...modelInput];
-        let uiMessages = [...baseWithTools];
-        for (let step = 0; step < maxSteps; step += 1) {
-          if (stopRequested) {
-            stopRequested = false;
-            chatBusy = false;
-            markSugarStopped();
-            chatState.messages = [...uiMessages, { role: 'assistant', content: 'Stopped.' }];
-            postChatState();
-            if (threadId) {
-              await addChatMessage(threadId, 'assistant', 'Stopped.');
-              await touchChatThread(threadId);
-              await refreshChatThreads();
-            }
-            return;
-          }
-          const assistantText = await callModelForChat({
-            messages: trimChatMessagesForModel(modelTrace, historyLimit),
-            mode: chatState.mode,
-            context: chatState.contexts
-          });
-          const trimmedAssistant = String(assistantText || '').trim();
-          if (!trimmedAssistant) {
-            markSugarFailure();
-            const content = 'Error: model returned an empty response. Try another model or check the endpoint.';
-            chatState.messages = [...uiMessages, { role: 'assistant', content }];
-            postChatState();
-            if (threadId) {
-              await addChatMessage(threadId, 'assistant', content);
-              await touchChatThread(threadId);
-              await refreshChatThreads();
-            }
-            return;
-          }
-          let parsed = parseAgentResponse(assistantText);
-          if (!parsed) {
-            parsed = parseTaggedToolCalls(assistantText)
-              || extractToolCallsFromText(assistantText)
-              || extractLooseToolCalls(assistantText);
-          }
-          const todoExtraction = extractTodoFromText(assistantText);
-          const extractedTodo = todoExtraction ? todoExtraction.todo : null;
-          const displayText = todoExtraction
-            ? stripTodoJsonFromText(assistantText, todoExtraction.range)
-            : assistantText;
-          if (parsed && parsed.toolCalls && parsed.toolCalls.length) {
-            if (parsed.text && parsed.text.trim()) {
-              const leadText = parsed.text.trim();
-              uiMessages.push({ role: 'assistant', content: leadText });
-              chatState.messages = uiMessages;
-              postChatState();
-              if (threadId) {
-                await addChatMessage(threadId, 'assistant', leadText);
-                await touchChatThread(threadId);
-                await refreshChatThreads();
-              }
-            }
-            modelTrace.push({ role: 'assistant', content: assistantText });
-            const toolMessages = [];
-            const modelToolMessages = [];
-            for (const call of parsed.toolCalls) {
-              const normalizedCall = normalizeToolCall(call);
-              const toolLabel = describeToolCall(normalizedCall);
-              toolMessages.push({ role: 'assistant', content: toolLabel });
-              const result = await runToolCall(normalizedCall);
-              const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
-              toolMessages.push({ role: 'assistant', content: resultText });
-              modelToolMessages.push({ role: 'user', content: resultText });
-            }
-            uiMessages = [...uiMessages, ...toolMessages];
-            chatState.messages = uiMessages;
-            postChatState();
-            if (threadId) {
-              for (const toolMsg of toolMessages) {
-                await addChatMessage(threadId, 'assistant', toolMsg.content);
-              }
-              await touchChatThread(threadId);
-              await refreshChatThreads();
-            }
-            modelTrace = trimChatMessagesForModel([...modelTrace, ...modelToolMessages], historyLimit);
-            continue;
-          }
-          if (chatState.mode === 'planner' && parsed && Array.isArray(parsed.plan)) {
-            await applyPlanUpdate(parsed.plan);
-          }
-          if (chatState.mode !== 'planner') {
-            if (parsed && parsed.todo) {
-              await applyTodoUpdate(parsed.todo);
-            } else if (extractedTodo) {
-              await applyTodoUpdate(extractedTodo);
-            }
-          }
-          const cleanedDisplay = displayText && displayText.trim() ? displayText : '';
-          let content = parsed && parsed.final
-            ? parsed.final
-            : (cleanedDisplay ? cleanedDisplay : '(empty response)');
-          const isBareTodo = parsed && parsed.todo
-            ? isBareTodoResponse(parsed, assistantText)
-            : (extractedTodo && !cleanedDisplay);
-          if (isBareTodo) {
-            chatState.messages = uiMessages;
-            postChatState();
-            if (threadId) {
-              await touchChatThread(threadId);
-              await refreshChatThreads();
-            }
-          } else {
-            uiMessages = [...uiMessages, { role: 'assistant', content }];
-            chatState.messages = uiMessages;
-            postChatState();
-            if (threadId) {
-              await addChatMessage(threadId, 'assistant', content);
-              await touchChatThread(threadId);
-              await refreshChatThreads();
-            }
-          }
-          return;
-        }
-        markSugarFailure();
-        uiMessages = [...uiMessages, { role: 'assistant', content: 'Chat stopped: too many tool steps.' }];
-        chatState.messages = uiMessages;
-        postChatState();
+        
+        // Persist new messages to thread
+        const newMessages = chatState.messages.slice(beforeCount);
         if (threadId) {
-          await addChatMessage(threadId, 'assistant', 'Chat stopped: too many tool steps.');
+          for (const newMsg of newMessages) {
+            await addChatMessage(threadId, newMsg.role, newMsg.content);
+          }
           await touchChatThread(threadId);
           await refreshChatThreads();
         }
@@ -1258,6 +1366,13 @@ function parseSymbolsCommand(text) {
   const raw = String(text || '').trim();
   if (!raw.toLowerCase().startsWith('/symbols')) return null;
   const rest = raw.slice('/symbols'.length).trim();
+  return { query: rest };
+}
+
+function parseProblemsCommand(text) {
+  const raw = String(text || '').trim();
+  if (!raw.toLowerCase().startsWith('/problems')) return null;
+  const rest = raw.slice('/problems'.length).trim();
   return { query: rest };
 }
 
@@ -1550,6 +1665,33 @@ async function buildSymbolsContextMessage(query) {
   return formatToolResultForUi('search_symbols', result);
 }
 
+async function buildProblemsContextMessage() {
+  const diagnostics = vscode.languages.getDiagnostics();
+  const errors = [];
+  for (const [uri, diags] of diagnostics) {
+    if (!diags || !diags.length) continue;
+    const rel = toWorkspaceRelativePath(uri.fsPath);
+    for (const diag of diags) {
+      // Only include errors, not warnings or info
+      if (diag.severity !== vscode.DiagnosticSeverity.Error) continue;
+      if (errors.length >= 100) break;
+      const line = diag.range.start.line + 1;
+      const col = diag.range.start.character + 1;
+      const source = diag.source ? ` [${diag.source}]` : '';
+      const code = diag.code ? ` (${diag.code})` : '';
+      errors.push(`${rel}:${line}:${col}${source}${code} - ${diag.message}`);
+    }
+    if (errors.length >= 100) break;
+  }
+  
+  if (!errors.length) {
+    return formatToolResultForUi('problems', 'No errors found in workspace.');
+  }
+  
+  const output = `Workspace Errors (${errors.length}):\n` + errors.join('\n');
+  return formatToolResultForUi('problems', output);
+}
+
 async function upsertDebugContext(content) {
   await ensureChatReady();
   const entry = {
@@ -1585,7 +1727,6 @@ async function removeDebugContext() {
 function isTrivialAgentFinal(text) {
   const raw = String(text || '').trim().toLowerCase();
   if (!raw) return true;
-  if (raw === 'all todo items completed.') return true;
   if (raw === 'stopped.') return true;
   if (raw.startsWith('error:')) return true;
   return false;
@@ -1599,21 +1740,6 @@ function trimAgentMemoryText(text) {
   if (raw.length <= limit) return raw.trim();
   const tail = raw.slice(raw.length - limit);
   return tail.replace(/^\s+/, '').trimEnd();
-}
-
-function formatAgentMemoryEntry(summary) {
-  const cleaned = String(summary || '').trim();
-  if (!cleaned) return '';
-  const body = cleaned.replace(/^Summary of actions this step:\s*/i, '').trim();
-  const filteredLines = body.split(/\r?\n/).filter((line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return false;
-    return !(trimmed.startsWith('- read_dir') || trimmed.startsWith('- list_files'));
-  });
-  const filtered = filteredLines.join('\n').trim();
-  if (!filtered) return '';
-  const stamp = new Date().toISOString();
-  return `Actions @ ${stamp}\n${filtered}`;
 }
 
 function formatAgentOutcomeMemory(text) {
@@ -1632,8 +1758,15 @@ async function appendAgentMemory(entryText) {
   if (!limit) return;
   const entry = String(entryText || '').trim();
   if (!entry) return;
-  const ok = await ensureChatDbReady();
-  if (!ok || !activeChatThreadId) return;
+  
+  try {
+    await chatDatabase.ensureReady();
+  } catch {
+    return;
+  }
+  
+  if (!activeChatThreadId) return;
+  
   const existing = chatState.contexts.find((ctx) => String(ctx.id) === AGENT_MEMORY_CONTEXT_ID);
   const existingContent = existing && existing.content ? String(existing.content) : '';
   if (existingContent && existingContent.trim().endsWith(entry)) {
@@ -1671,487 +1804,13 @@ async function refreshDebugSnapshot() {
   }
 }
 
-function parseAgentResponse(text) {
-  const parsed = safeJsonParse(text) || safeJsonParse(extractFirstJsonPayload(text));
-  if (!parsed || typeof parsed !== 'object') return null;
-  const todo = Array.isArray(parsed.todo) ? parsed.todo : (Array.isArray(parsed.todos) ? parsed.todos : null);
-  const normalizedTodo = todo ? normalizeTodoList(todo) : null;
-  const hasPlan = Array.isArray(parsed.plan);
-  const normalizedPlan = hasPlan ? normalizePlanList(parsed.plan) : null;
-  const parsedText = typeof parsed.text === 'string' ? parsed.text : '';
-  if (typeof parsed.final === 'string') {
-    const out = { final: parsed.final, todo: normalizedTodo };
-    if (hasPlan) out.plan = normalizedPlan;
-    return out;
-  }
-  if (typeof parsed.reply === 'string') {
-    const out = { final: parsed.reply, todo: normalizedTodo };
-    if (hasPlan) out.plan = normalizedPlan;
-    return out;
-  }
-  if (Array.isArray(parsed.toolCalls)) {
-    const out = { toolCalls: parsed.toolCalls, todo: normalizedTodo, text: parsedText };
-    if (hasPlan) out.plan = normalizedPlan;
-    return out;
-  }
-  if (parsed.tool && typeof parsed.tool === 'string') {
-    const out = { toolCalls: [{ tool: parsed.tool, args: parsed.args || {} }], todo: normalizedTodo, text: parsedText };
-    if (hasPlan) out.plan = normalizedPlan;
-    return out;
-  }
-  if (normalizedTodo || (normalizedPlan && normalizedPlan.length) || hasPlan) {
-    const out = { todo: normalizedTodo, text: parsedText };
-    if (hasPlan) out.plan = normalizedPlan;
-    return out;
-  }
-  return null;
-}
-
-function extractTodoFromText(text) {
-  const src = String(text || '');
-  const ranges = [];
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escape = false;
-
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (inString) {
-      if (escape) {
-        escape = false;
-      } else if (ch === '\\\\') {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === '{') {
-      if (depth === 0) start = i;
-      depth += 1;
-      continue;
-    }
-    if (ch === '}' && depth > 0) {
-      depth -= 1;
-      if (depth === 0 && start >= 0) {
-        ranges.push([start, i + 1]);
-        start = -1;
-      }
-    }
-  }
-
-  for (const [from, to] of ranges) {
-    const chunk = src.slice(from, to);
-    const parsed = safeJsonParse(chunk);
-    if (!parsed || typeof parsed !== 'object') continue;
-    const todo = Array.isArray(parsed.todo) ? parsed.todo : (Array.isArray(parsed.todos) ? parsed.todos : null);
-    const normalized = todo ? normalizeTodoList(todo) : null;
-    if (normalized && normalized.length) {
-      return { todo: normalized, range: [from, to] };
-    }
-  }
-  return null;
-}
-
-function stripTodoJsonFromText(text, range) {
-  const src = String(text || '');
-  if (!range || range.length !== 2) return src.trim();
-  const from = Number(range[0]);
-  const to = Number(range[1]);
-  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return src.trim();
-
-  const fenceStart = src.lastIndexOf('```', from);
-  if (fenceStart !== -1) {
-    const fenceEnd = src.indexOf('```', to);
-    if (fenceEnd !== -1) {
-      const lineEnd = src.indexOf('\n', fenceStart + 3);
-      if (lineEnd !== -1 && lineEnd < fenceEnd) {
-        const innerStart = lineEnd + 1;
-        const innerEnd = fenceEnd;
-        if (from >= innerStart && to <= innerEnd) {
-          const beforeInner = src.slice(innerStart, from);
-          const afterInner = src.slice(to, innerEnd);
-          if (!beforeInner.trim() && !afterInner.trim()) {
-            return (src.slice(0, fenceStart) + src.slice(fenceEnd + 3))
-              .replace(/\n{3,}/g, '\n\n')
-              .trim();
-          }
-        }
-      }
-    }
-  }
-
-  return (src.slice(0, from) + src.slice(to))
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function parseTaggedToolCalls(text) {
-  const src = String(text || '');
-  const toolCalls = [];
-  const parts = [];
-  let cursor = 0;
-
-  while (cursor < src.length) {
-    const toolIdx = src.indexOf('[TOOL_CALLS]', cursor);
-    if (toolIdx === -1) {
-      parts.push(src.slice(cursor));
-      break;
-    }
-    parts.push(src.slice(cursor, toolIdx));
-    const toolNameStart = toolIdx + '[TOOL_CALLS]'.length;
-    const argsIdx = src.indexOf('[ARGS]', toolNameStart);
-    if (argsIdx === -1) {
-      parts.push(src.slice(toolIdx));
-      break;
-    }
-    const toolName = src.slice(toolNameStart, argsIdx).trim();
-    const argsStart = argsIdx + '[ARGS]'.length;
-    const nextToolIdx = src.indexOf('[TOOL_CALLS]', argsStart);
-    const argsText = (nextToolIdx === -1 ? src.slice(argsStart) : src.slice(argsStart, nextToolIdx)).trim();
-
-    if (toolName) {
-      const args = safeJsonParse(argsText) || safeJsonParse(extractFirstJsonPayload(argsText)) || {};
-      toolCalls.push({ tool: toolName, args });
-    } else {
-      parts.push(src.slice(toolIdx, nextToolIdx === -1 ? src.length : nextToolIdx));
-    }
-
-    cursor = nextToolIdx === -1 ? src.length : nextToolIdx;
-  }
-
-  const textOut = parts.join('').trim();
-  return toolCalls.length ? { toolCalls, text: textOut } : null;
-}
-
-function extractToolCallsFromText(text) {
-  const src = String(text || '');
-  const toolCalls = [];
-  const ranges = [];
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escape = false;
-
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (inString) {
-      if (escape) {
-        escape = false;
-      } else if (ch === '\\\\') {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === '{') {
-      if (depth === 0) start = i;
-      depth += 1;
-      continue;
-    }
-    if (ch === '}' && depth > 0) {
-      depth -= 1;
-      if (depth === 0 && start >= 0) {
-        const chunk = src.slice(start, i + 1);
-        const parsed = safeJsonParse(chunk);
-        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.toolCalls)) {
-          toolCalls.push(...parsed.toolCalls);
-          ranges.push([start, i + 1]);
-        }
-        start = -1;
-      }
-    }
-  }
-
-  if (!toolCalls.length) return null;
-
-  let remaining = '';
-  let cursor = 0;
-  for (const [from, to] of ranges) {
-    if (from > cursor) remaining += src.slice(cursor, from);
-    cursor = to;
-  }
-  if (cursor < src.length) remaining += src.slice(cursor);
-  const textOut = remaining.trim();
-  return { toolCalls, text: textOut };
-}
-
-function extractLooseToolCalls(text) {
-  const src = String(text || '');
-  const toolCalls = [];
-  let cursor = 0;
-
-  while (cursor < src.length) {
-    const toolIdx = src.indexOf('"tool"', cursor);
-    if (toolIdx === -1) break;
-
-    const colonIdx = src.indexOf(':', toolIdx + 6);
-    if (colonIdx === -1) {
-      cursor = toolIdx + 6;
-      continue;
-    }
-    const quoteStart = src.indexOf('"', colonIdx + 1);
-    if (quoteStart === -1) {
-      cursor = colonIdx + 1;
-      continue;
-    }
-    let quoteEnd = quoteStart + 1;
-    while (quoteEnd < src.length) {
-      if (src[quoteEnd] === '"' && src[quoteEnd - 1] !== '\\') break;
-      quoteEnd += 1;
-    }
-    if (quoteEnd >= src.length) {
-      cursor = quoteStart + 1;
-      continue;
-    }
-    const toolName = src.slice(quoteStart + 1, quoteEnd).trim();
-    if (!toolName) {
-      cursor = quoteEnd + 1;
-      continue;
-    }
-
-    const argsKeyIdx = src.indexOf('"args"', quoteEnd);
-    if (argsKeyIdx === -1) {
-      cursor = quoteEnd + 1;
-      continue;
-    }
-    const argsColonIdx = src.indexOf(':', argsKeyIdx + 6);
-    if (argsColonIdx === -1) {
-      cursor = argsKeyIdx + 6;
-      continue;
-    }
-    const braceStart = src.indexOf('{', argsColonIdx);
-    if (braceStart === -1) {
-      cursor = argsColonIdx + 1;
-      continue;
-    }
-
-    let depth = 0;
-    let inString = false;
-    let escape = false;
-    let braceEnd = -1;
-    for (let i = braceStart; i < src.length; i += 1) {
-      const ch = src[i];
-      if (inString) {
-        if (escape) {
-          escape = false;
-        } else if (ch === '\\\\') {
-          escape = true;
-        } else if (ch === '"') {
-          inString = false;
-        }
-        continue;
-      }
-      if (ch === '"') {
-        inString = true;
-        continue;
-      }
-      if (ch === '{') {
-        depth += 1;
-        continue;
-      }
-      if (ch === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          braceEnd = i;
-          break;
-        }
-      }
-    }
-    if (braceEnd === -1) {
-      cursor = braceStart + 1;
-      continue;
-    }
-
-    const argsText = src.slice(braceStart, braceEnd + 1);
-    const args = safeJsonParse(argsText) || safeJsonParse(extractFirstJsonPayload(argsText)) || {};
-    toolCalls.push({ tool: toolName, args });
-    cursor = braceEnd + 1;
-  }
-
-  if (!toolCalls.length) return null;
-  return { toolCalls, text: '' };
-}
-
-function normalizeTodoItem(item, index) {
-  if (!item || typeof item !== 'object') {
-    return { id: `todo_${index + 1}`, text: String(item || '').trim(), status: 'pending' };
-  }
-  const text = String(item.text || item.title || item.description || '').trim();
-  if (!text) return null;
-  const statusRaw = String(item.status || '').toLowerCase();
-  const status = statusRaw === 'done' || statusRaw === 'complete' ? 'done' : 'pending';
-  const id = String(item.id || `todo_${index + 1}`);
-  return { id, text, status };
-}
-
-function normalizeTodoList(input) {
-  if (!Array.isArray(input)) return [];
-  const list = input.map((item, index) => normalizeTodoItem(item, index)).filter(Boolean);
-  return list;
-}
-
-function normalizePlanItem(item, index) {
-  if (!item || typeof item !== 'object') {
-    return { id: `plan_${index + 1}`, text: String(item || '').trim(), status: 'pending' };
-  }
-  const text = String(item.text || item.title || item.description || '').trim();
-  if (!text) return null;
-  const id = String(item.id || `plan_${index + 1}`);
-  const statusRaw = String(item.status || '').toLowerCase();
-  const status = statusRaw === 'done' || statusRaw === 'complete' ? 'done' : 'pending';
-  return { id, text, status };
-}
-
-function normalizePlanList(input) {
-  if (!Array.isArray(input)) return [];
-  const list = input.map((item, index) => normalizePlanItem(item, index)).filter(Boolean);
-  return list;
-}
-
-function mergeTodoLists(current, incoming) {
-  const next = normalizeTodoList(incoming || []);
-  if (!next.length) return normalizeTodoList(current || []);
-  const currentList = normalizeTodoList(current || []);
-  const currentById = new Map(currentList.map((item) => [String(item.id), item]));
-  const currentByText = new Map(currentList.map((item) => [String(item.text).toLowerCase(), item]));
-
-  const merged = next.map((item) => {
-    const idKey = String(item.id);
-    const textKey = String(item.text).toLowerCase();
-    const existing = currentById.get(idKey) || currentByText.get(textKey);
-    if (!existing) return item;
-    const status = existing.status === 'done' || item.status === 'done' ? 'done' : 'pending';
-    return { ...item, status };
-  });
-
-  for (const item of currentList) {
-    if (item.status !== 'done') continue;
-    const idKey = String(item.id);
-    const textKey = String(item.text).toLowerCase();
-    const exists = merged.some((entry) => String(entry.id) === idKey || String(entry.text).toLowerCase() === textKey);
-    if (!exists) merged.push(item);
-  }
-
-  return merged;
-}
-
-function getPendingTodos(todos) {
-  if (!Array.isArray(todos)) return [];
-  return todos.filter((item) => item && item.status !== 'done');
-}
-
-function buildPlannerInstruction(todos) {
-  const pending = getPendingTodos(todos);
-  if (!pending.length) {
-    return '';
-  }
-  const list = todos.map((item, idx) => {
-    const status = item.status === 'done' ? 'done' : 'pending';
-    return `${idx + 1}. [${status}] ${item.text}`;
-  }).join('\n');
-  const next = pending[0];
-  return [
-    'You are executing a TODO plan. Focus on ONE pending item at a time.',
-    'Current TODOs:',
-    list,
-    '',
-    `Next item to execute: ${next.text}`,
-    'Work on the next item only, then return updated {"todo":[...]} with statuses.',
-    'Do not repeat the TODO list without taking action; use tools to make progress.'
-  ].join('\n');
-}
-
-async function applyTodoUpdate(incoming) {
-  const merged = mergeTodoLists(chatState.todos, incoming);
-  chatState.todos = merged;
-  if (activeChatThreadId) {
-    await updateChatThreadTodos(activeChatThreadId, chatState.todos);
-  }
-  postChatState();
-}
-
-async function setTodoList(nextTodos) {
-  chatState.todos = normalizeTodoList(nextTodos || []);
-  if (activeChatThreadId) {
-    await updateChatThreadTodos(activeChatThreadId, chatState.todos);
-  }
-  postChatState();
-}
-
-async function applyPlanUpdate(incoming) {
-  chatState.plan = normalizePlanList(incoming || []);
+async function applyPlanUpdate(plan) {
+  const merged = mergePlanLists(chatState.plan, plan);
+  chatState.plan = merged;
   if (activeChatThreadId) {
     await updateChatThreadPlan(activeChatThreadId, chatState.plan);
   }
   postChatState();
-}
-
-function stripCodeFence(text) {
-  const trimmed = String(text || '').trim();
-  if (!trimmed.startsWith('```')) return trimmed;
-  const match = trimmed.match(/^```[a-zA-Z]*\n([\s\S]*?)\n```$/);
-  if (match) return match[1].trim();
-  return trimmed;
-}
-
-function isBareTodoResponse(parsed, rawText) {
-  if (!parsed || !parsed.todo || parsed.final || (parsed.toolCalls && parsed.toolCalls.length)) return false;
-  const raw = String(rawText || '').trim();
-  const jsonText = extractFirstJsonPayload(raw);
-  if (!jsonText) return false;
-  const stripped = stripCodeFence(raw);
-  if (stripped !== jsonText.trim()) return false;
-  return true;
-}
-
-function extractTodoSeedFromText(text) {
-  const src = String(text || '').trim();
-  if (!src) return null;
-  const hasTodoCue = /todo|to[-\s]?do|task list|checklist|plan/i.test(src);
-  if (!hasTodoCue) return null;
-  const lines = src.split(/\r?\n/).map((line) => line.trim());
-  const items = [];
-  for (const line of lines) {
-    const match = /^(\d+)[\).]\s+(.*)$/.exec(line);
-    if (match) {
-      const textItem = match[2].trim();
-      if (textItem) items.push(textItem);
-    }
-  }
-  if (!items.length) return null;
-  return items;
-}
-
-function seedTodosFromPrompt(promptText) {
-  const items = extractTodoSeedFromText(promptText);
-  if (!items || !items.length) return null;
-  const seeded = items.map((text, index) => ({
-    id: `todo_${index + 1}`,
-    text,
-    status: 'pending'
-  }));
-  return seeded;
-}
-
-function seedTodosFromPlan(plan) {
-  const items = normalizePlanList(plan || []);
-  if (!items.length) return [];
-  return items.map((item, index) => ({
-    id: `todo_${index + 1}`,
-    text: item.text,
-    status: 'pending'
-  }));
 }
 
 function formatDiagnosticSeverity(severity) {
@@ -2535,109 +2194,6 @@ function describeToolCall(call) {
   return `Tool call: ${call.tool}`;
 }
 
-function summarizeToolArgs(tool, args) {
-  const safe = args && typeof args === 'object' ? args : {};
-  if (tool === 'search') return String(safe.query || '').trim();
-  if (tool === 'locate_file') return String(safe.query || safe.name || '').trim();
-  if (tool === 'read_file') {
-    const pathText = String(safe.path || '').trim();
-    const start = Number.isFinite(Number(safe.startLine)) ? Number(safe.startLine) : '';
-    const end = Number.isFinite(Number(safe.endLine)) ? Number(safe.endLine) : '';
-    const range = start && end ? ` lines ${start}-${end}` : '';
-    return `${pathText}${range}`.trim();
-  }
-  if (tool === 'read_files') {
-    const paths = Array.isArray(safe.paths) ? safe.paths : [];
-    return paths.join(', ');
-  }
-  if (tool === 'read_file_range_by_symbols') {
-    const pathText = String(safe.path || '').trim();
-    const symbols = Array.isArray(safe.symbols) ? safe.symbols.join(', ') : String(safe.symbols || '').trim();
-    return `${pathText}${symbols ? ` (${symbols})` : ''}`.trim();
-  }
-  if (tool === 'search_symbols' || tool === 'workspace_symbols') {
-    return String(safe.query || '').trim();
-  }
-  if (tool === 'document_symbols') {
-    return String(safe.uri || safe.path || '').trim();
-  }
-  if (tool === 'definition'
-      || tool === 'type_definition'
-      || tool === 'implementation'
-      || tool === 'references'
-      || tool === 'hover'
-      || tool === 'signature_help'
-      || tool === 'call_hierarchy_prepare'
-      || tool === 'rename_prepare'
-      || tool === 'rename_apply'
-      || tool === 'semantic_tokens') {
-    const uri = String(safe.uri || safe.path || '').trim();
-    const line = Number.isFinite(Number(safe.line)) ? Number(safe.line) : '';
-    const character = Number.isFinite(Number(safe.character)) ? Number(safe.character) : '';
-    const pos = line && character ? ` @ ${line}:${character}` : '';
-    const suffix = tool === 'rename_apply' && safe.newName ? ` -> ${String(safe.newName).trim()}` : '';
-    return `${uri}${pos}${suffix}`.trim();
-  }
-  if (tool === 'call_hierarchy_incoming' || tool === 'call_hierarchy_outgoing') {
-    return String(safe.itemId || safe.id || '').trim();
-  }
-  if (tool === 'list_files') {
-    const include = safe.include ? `include=${safe.include}` : '';
-    const exclude = safe.exclude ? `exclude=${safe.exclude}` : '';
-    return [include, exclude].filter(Boolean).join(' ');
-  }
-  if (tool === 'file_stat') return String(safe.path || '').trim();
-  if (tool === 'read_dir') {
-    const pathText = String(safe.path || '').trim();
-    const depth = Number.isFinite(Number(safe.maxDepth)) ? `depth=${Number(safe.maxDepth)}` : '';
-    return [pathText, depth].filter(Boolean).join(' ');
-  }
-  if (tool === 'read_output') {
-    const maxChars = Number.isFinite(Number(safe.maxChars)) ? `maxChars=${Number(safe.maxChars)}` : '';
-    const tail = safe.tail === false ? 'tail=false' : '';
-    return [maxChars, tail].filter(Boolean).join(' ');
-  }
-  if (tool === 'run_command') {
-    const cmd = String(safe.command || '').trim();
-    const cwd = String(safe.cwd || '').trim();
-    return cwd ? `${cmd} (cwd: ${cwd})` : cmd;
-  }
-  if (tool === 'edit_file') {
-    const pathText = String(safe.path || '').trim();
-    const start = Number.isFinite(Number(safe.startLine)) ? Number(safe.startLine) : '';
-    const end = Number.isFinite(Number(safe.endLine)) ? Number(safe.endLine) : '';
-    const range = start && end ? ` lines ${start}-${end}` : '';
-    return `${pathText}${range}`.trim();
-  }
-  if (tool === 'insert_text') {
-    const pathText = String(safe.path || '').trim();
-    const line = Number.isFinite(Number(safe.line)) ? Number(safe.line) : Number(safe.position && safe.position.line);
-    const character = Number.isFinite(Number(safe.character)) ? Number(safe.character) : Number(safe.position && safe.position.character);
-    const pos = Number.isFinite(line) && Number.isFinite(character) ? ` @ ${line}:${character}` : '';
-    return `${pathText}${pos}`.trim();
-  }
-  if (tool === 'replace_range') return String(safe.path || '').trim();
-  if (tool === 'copy_file') {
-    const from = String(safe.from || '').trim();
-    const to = String(safe.to || '').trim();
-    return `${from} -> ${to}`.trim();
-  }
-  if (tool === 'apply_patch' || tool === 'apply_patch_preview') {
-    const patch = String(safe.patch || safe.diff || '');
-    return patch ? `${patch.length} chars` : '';
-  }
-  if (tool === 'write_file') return String(safe.path || '').trim();
-  if (tool === 'create_dir') return String(safe.path || '').trim();
-  if (tool === 'delete_file') return String(safe.path || '').trim();
-  if (tool === 'move_file') {
-    const from = String(safe.from || '').trim();
-    const to = String(safe.to || '').trim();
-    return `${from} -> ${to}`.trim();
-  }
-  const raw = Object.keys(safe).length ? JSON.stringify(safe) : '';
-  if (!raw) return '';
-  return raw.length > 160 ? `${raw.slice(0, 160)}...` : raw;
-}
 
 function isToolResultSuccess(resultText) {
   const raw = String(resultText || '').trim().toLowerCase();
@@ -2712,75 +2268,12 @@ function buildSearchSignature(args) {
   return JSON.stringify({ query, include, exclude, maxResults });
 }
 
-function buildToolBatchSummary(calls) {
-  if (!Array.isArray(calls) || !calls.length) return '';
-  const grouped = new Map();
-  const order = [];
-  for (const call of calls) {
-    if (!call || typeof call.tool !== 'string') continue;
-    const tool = call.tool;
-    if (!grouped.has(tool)) {
-      grouped.set(tool, []);
-      order.push(tool);
-    }
-    const detail = summarizeToolArgs(tool, call.args);
-    if (detail) grouped.get(tool).push(detail);
-  }
-  if (!order.length) return '';
-
-  const lines = ['Summary of actions this step:'];
-  for (const tool of order) {
-    const entries = grouped.get(tool) || [];
-    const count = entries.length || 1;
-    if (!entries.length) {
-      lines.push(`- ${tool} (${count})`);
-      continue;
-    }
-    const shown = entries.slice(0, 4).join(', ');
-    const suffix = entries.length > 4 ? ` (+${entries.length - 4} more)` : '';
-    lines.push(`- ${tool} (${entries.length}): ${shown}${suffix}`);
-  }
-  return lines.join('\n');
-}
-
-function formatToolResultForUi(tool, resultText) {
-  const label = tool ? `Tool result (${tool}):` : 'Tool result:';
-  const body = String(resultText || '').trim();
-  const hasFence = body.includes('```');
-  if (tool === 'run_command') {
-    return `${label}\n\`\`\`\n${body}\n\`\`\``;
-  }
-  const codeTools = new Set(['read_file', 'read_files', 'read_file_range_by_symbols', 'read_output']);
-  if (tool && codeTools.has(tool)) {
-    if (hasFence) return `${label}\n${body}`;
-    return `${label}\n\`\`\`\n${body}\n\`\`\``;
-  }
-  return `${label}\n${resultText}`;
-}
-
 function isLikelyFileQuery(query) {
   const raw = String(query || '').trim();
   if (!raw) return false;
   if (/\s/.test(raw)) return false;
   if (raw.includes('/') || raw.includes('\\')) return true;
   return /\\.([a-z0-9]{1,6})$/i.test(raw);
-}
-
-function normalizeToolCall(call) {
-  if (!call || typeof call.tool !== 'string') return call;
-  const args = call.args && typeof call.args === 'object' ? { ...call.args } : {};
-  const toolName = String(call.tool || '');
-  if (toolName.startsWith('container.')) {
-    const mapped = normalizeContainerToolCall(toolName, args);
-    if (mapped) return mapped;
-  }
-  if (call.tool === 'search') {
-    const query = String(args.query || '').trim();
-    if (isLikelyFileQuery(query)) {
-      return { tool: 'locate_file', args: { ...args, query } };
-    }
-  }
-  return { tool: call.tool, args };
 }
 
 function normalizeContainerToolCall(toolName, args) {
@@ -2879,348 +2372,292 @@ function setAgentContinuation(messages) {
   }
 }
 
-async function runAgentTurn(baseMessages, modelMessagesSeed) {
-  const uiMessages = [...baseMessages];
-  let modelMessages = Array.isArray(modelMessagesSeed) && modelMessagesSeed.length
-    ? [...modelMessagesSeed]
-    : [...baseMessages];
-  const maxSteps = getAgentMaxSteps();
-  const historyLimit = getChatHistoryCharLimit();
-  const mutatingTools = new Set([
-    'edit_file',
-    'write_file',
-    'create_dir',
-    'delete_file',
-    'move_file',
-    'apply_patch',
-    'run_command'
-  ]);
-  const verifyTools = new Set(['read_dir', 'list_files']);
-  let lastBareTodoSignature = null;
-  let bareTodoRepeatCount = 0;
-  let lastCommandSignature = null;
-  let sawMutationSinceCommand = false;
-  let lastSearchSignature = null;
-  let lastSearchWasMiss = false;
-  let sawMutationSinceSearch = false;
-  let mutationSinceProblems = false;
-  let lastSuccessfulSummary = '';
-
-  for (let step = 0; step < maxSteps; step++) {
-    if (stopRequested) {
-      stopRequested = false;
-      chatBusy = false;
-      setAgentContinuation(null);
-      uiMessages.push({ role: 'assistant', content: 'Stopped.' });
-      chatState.messages = uiMessages;
-      postChatState();
-      return 'stopped';
-    }
-    const pendingTodos = getPendingTodos(chatState.todos);
-    const plannerText = pendingTodos.length ? buildPlannerInstruction(chatState.todos) : '';
-    const plannerMessage = plannerText
-      ? { role: 'user', content: plannerText }
-      : null;
-    const modelSeed = plannerMessage ? [...modelMessages, plannerMessage] : modelMessages;
-    const assistantText = await callModelForChat({
-      messages: trimChatMessagesForModel(modelSeed, historyLimit),
-      mode: 'agent',
-      context: chatState.contexts
-    });
-    const trimmedAssistant = String(assistantText || '').trim();
-    if (!trimmedAssistant) {
-      setAgentContinuation(null);
-      uiMessages.push({
-        role: 'assistant',
-        content: 'Error: model returned an empty response. Try another model or check the endpoint.'
-      });
-      chatState.messages = uiMessages;
-      postChatState();
-      return 'failure';
-    }
-    let parsed = parseAgentResponse(assistantText);
-    if (!parsed) {
-      parsed = parseTaggedToolCalls(assistantText)
-        || extractToolCallsFromText(assistantText)
-        || extractLooseToolCalls(assistantText);
-    }
-    const todoExtraction = extractTodoFromText(assistantText);
-    if (!parsed && todoExtraction && todoExtraction.todo) {
-      parsed = { todo: todoExtraction.todo };
-    }
-    const cleanedAssistantText = todoExtraction
-      ? stripTodoJsonFromText(assistantText, todoExtraction.range)
-      : assistantText;
-    modelMessages.push({ role: 'assistant', content: assistantText });
-    modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-
-    if (!parsed) {
-      setAgentContinuation(null);
-      uiMessages.push({ role: 'assistant', content: assistantText });
-      if (lastSuccessfulSummary && uiMessages[uiMessages.length - 1].content !== lastSuccessfulSummary) {
-        uiMessages.push({ role: 'assistant', content: lastSuccessfulSummary });
-      }
-      chatState.messages = uiMessages;
-      return 'success';
-    }
-
-    if (parsed.final) {
-      if (parsed.todo) {
-        await applyTodoUpdate(parsed.todo);
-      } else if (todoSeedCache && todoSeedCache.length) {
-        await applyTodoUpdate(todoSeedCache);
-      }
-      if (mutationSinceProblems && getPendingTodos(chatState.todos).length === 0) {
-        const problems = collectWorkspaceProblems(50);
-        if (problems.length) {
-          const problemsText = formatToolResultForUi(
-            'problems',
-            `Workspace problems (${problems.length}):\n` + problems.join('\n')
-          );
-          mutationSinceProblems = false;
-          uiMessages.push({ role: 'assistant', content: problemsText });
-          modelMessages.push({ role: 'user', content: problemsText });
-          modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-          chatState.messages = uiMessages;
-          postChatState();
-          continue;
-        }
-      }
-      const outcomeMemory = formatAgentOutcomeMemory(parsed.final);
-      if (outcomeMemory) {
-        await appendAgentMemory(outcomeMemory);
-      }
-      setAgentContinuation(null);
-      uiMessages.push({ role: 'assistant', content: parsed.final });
-      chatState.messages = uiMessages;
-      return 'success';
-    }
-
-    if (parsed.toolCalls && parsed.toolCalls.length) {
-      lastBareTodoSignature = null;
-      bareTodoRepeatCount = 0;
-      if (parsed.todo) {
-        await applyTodoUpdate(parsed.todo);
-      } else if (todoSeedCache && todoSeedCache.length) {
-        await applyTodoUpdate(todoSeedCache);
-      }
-      if (parsed.text && parsed.text.trim()) {
-        uiMessages.push({ role: 'assistant', content: parsed.text.trim() });
-        chatState.messages = uiMessages;
-        postChatState();
-      }
-      let didMutate = false;
-      let didVerify = false;
-      const executedCalls = [];
-      for (const call of parsed.toolCalls) {
-        const normalizedCall = normalizeToolCall(call);
-        uiMessages.push({ role: 'assistant', content: describeToolCall(normalizedCall) });
-        chatState.messages = uiMessages;
-        postChatState();
-
-        if (normalizedCall && mutatingTools.has(normalizedCall.tool)) {
-          didMutate = true;
-          mutationSinceProblems = true;
-        }
-        if (normalizedCall && verifyTools.has(normalizedCall.tool)) didVerify = true;
-
-        if (normalizedCall && normalizedCall.tool === 'run_command') {
-          const command = normalizedCall.args && normalizedCall.args.command
-            ? String(normalizedCall.args.command).trim()
-            : '';
-          const cwd = normalizedCall.args && normalizedCall.args.cwd
-            ? String(normalizedCall.args.cwd).trim()
-            : '';
-          const timeoutMs = normalizedCall.args && normalizedCall.args.timeoutMs
-            ? Number(normalizedCall.args.timeoutMs)
-            : '';
-          const signature = JSON.stringify({ command, cwd, timeoutMs });
-          if (lastCommandSignature && signature === lastCommandSignature && !sawMutationSinceCommand) {
-            const skipped = 'Skipped: command already run with the same args and no file changes since then. Make a change or ask to force a rerun.';
-            const resultText = formatToolResultForUi('run_command', skipped);
-            uiMessages.push({ role: 'assistant', content: resultText });
-            modelMessages.push({ role: 'user', content: resultText });
-            modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-            chatState.messages = uiMessages;
-            postChatState();
-            continue;
-          }
-          const result = await runToolCall(normalizedCall);
-          if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
-          lastCommandSignature = signature;
-          sawMutationSinceCommand = false;
-          const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
-          uiMessages.push({ role: 'assistant', content: resultText });
-          modelMessages.push({ role: 'user', content: resultText });
-          modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-          chatState.messages = uiMessages;
-          postChatState();
-          continue;
-        }
-
-        if (normalizedCall && normalizedCall.tool === 'search') {
-          const signature = buildSearchSignature(normalizedCall.args);
-          if (lastSearchSignature
-              && signature === lastSearchSignature
-              && lastSearchWasMiss
-              && !sawMutationSinceSearch) {
-            const skipped = 'Skipped: search already run with the same args and no file changes since then. Update the query or modify files to try again.';
-            const resultText = formatToolResultForUi('search', skipped);
-            uiMessages.push({ role: 'assistant', content: resultText });
-            modelMessages.push({ role: 'user', content: resultText });
-            modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-            chatState.messages = uiMessages;
-            postChatState();
-            continue;
-          }
-
-          const result = await runToolCall(normalizedCall);
-          if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
-          lastSearchSignature = signature;
-          lastSearchWasMiss = isSearchResultMiss(result);
-          sawMutationSinceSearch = false;
-          const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
-          uiMessages.push({ role: 'assistant', content: resultText });
-          modelMessages.push({ role: 'user', content: resultText });
-          modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-          chatState.messages = uiMessages;
-          postChatState();
-          continue;
-        }
-
-        const result = await runToolCall(normalizedCall);
-        if (normalizedCall && isToolResultSuccess(result)) executedCalls.push(normalizedCall);
-        const resultText = formatToolResultForUi(normalizedCall.tool, limitToolOutput(result, 12000));
-        uiMessages.push({ role: 'assistant', content: resultText });
-        modelMessages.push({ role: 'user', content: resultText });
-        modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-        chatState.messages = uiMessages;
-        postChatState();
-
-        if (normalizedCall && mutatingTools.has(normalizedCall.tool)) {
-          sawMutationSinceCommand = true;
-          sawMutationSinceSearch = true;
-          mutationSinceProblems = true;
-        }
-      }
-
-      if (didMutate && !didVerify) {
-        const runner = getToolRunner();
-        const readDirCall = { tool: 'read_dir', args: { path: '.', maxDepth: 3, maxEntries: 400 } };
-        const tree = await runner.toolReadDir(readDirCall.args);
-        if (isToolResultSuccess(tree)) executedCalls.push(readDirCall);
-        const treeText = formatToolResultForUi('read_dir', limitToolOutput(tree, 12000));
-        uiMessages.push({ role: 'assistant', content: treeText });
-        modelMessages.push({ role: 'user', content: treeText });
-
-        const listFilesCall = { tool: 'list_files', args: { include: '**/*', exclude: '**/node_modules/**', maxResults: 200 } };
-        const files = await runner.toolListFiles(listFilesCall.args);
-        if (isToolResultSuccess(files)) executedCalls.push(listFilesCall);
-        const filesText = formatToolResultForUi('list_files', limitToolOutput(files, 12000));
-        uiMessages.push({ role: 'assistant', content: filesText });
-        modelMessages.push({ role: 'user', content: filesText });
-
-        modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-        chatState.messages = uiMessages;
-        postChatState();
-      }
-
-      const summary = buildToolBatchSummary(executedCalls);
-      if (summary) {
-        uiMessages.push({ role: 'assistant', content: summary });
-        // Treat summary like a tool observation so model messages end with user/tool.
-        modelMessages.push({ role: 'user', content: summary });
-        modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-        chatState.messages = uiMessages;
-        postChatState();
-        lastSuccessfulSummary = summary;
-        await appendAgentMemory(formatAgentMemoryEntry(summary));
-      }
-
-      continue;
-    }
-
-    if (parsed.todo) {
-      await applyTodoUpdate(parsed.todo);
-    } else if (todoSeedCache && todoSeedCache.length) {
-      await applyTodoUpdate(todoSeedCache);
-    }
-    const cleanedBody = cleanedAssistantText && cleanedAssistantText.trim() ? cleanedAssistantText : '';
-    const isBareTodo = parsed.todo
-      ? isBareTodoResponse(parsed, assistantText)
-      : (todoExtraction && !cleanedBody);
-    if (!isBareTodo) {
-      if (mutationSinceProblems && getPendingTodos(chatState.todos).length === 0) {
-        const problems = collectWorkspaceProblems(50);
-        if (problems.length) {
-          const problemsText = formatToolResultForUi(
-            'problems',
-            `Workspace problems (${problems.length}):\n` + problems.join('\n')
-          );
-          mutationSinceProblems = false;
-          uiMessages.push({ role: 'assistant', content: problemsText });
-          modelMessages.push({ role: 'user', content: problemsText });
-          modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-          chatState.messages = uiMessages;
-          postChatState();
-          continue;
-        }
-      }
-      const outcomeSource = cleanedBody || assistantText;
-      const outcomeMemory = formatAgentOutcomeMemory(outcomeSource);
-      if (outcomeMemory) {
-        await appendAgentMemory(outcomeMemory);
-      }
-      setAgentContinuation(null);
-      uiMessages.push({ role: 'assistant', content: cleanedBody || assistantText });
-      chatState.messages = uiMessages;
-      return 'success';
-    }
-    const todoSignature = parsed.todo ? JSON.stringify(normalizeTodoList(parsed.todo)) : null;
-    if (todoSignature && todoSignature === lastBareTodoSignature) {
-      bareTodoRepeatCount += 1;
-    } else {
-      bareTodoRepeatCount = 0;
-      lastBareTodoSignature = todoSignature;
-    }
-    if (bareTodoRepeatCount >= 1) {
-      modelMessages.push({
-        role: 'user',
-        content: 'You are repeating the TODO list without acting. Use tools to complete the next item now. Do not return only TODO JSON.'
-      });
-      modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-    }
-    const stillPending = getPendingTodos(chatState.todos).length > 0;
-    if (!stillPending) {
-      if (mutationSinceProblems) {
-        const problems = collectWorkspaceProblems(50);
-        if (problems.length) {
-          const problemsText = formatToolResultForUi(
-            'problems',
-            `Workspace problems (${problems.length}):\n` + problems.join('\n')
-          );
-          mutationSinceProblems = false;
-          uiMessages.push({ role: 'assistant', content: problemsText });
-          modelMessages.push({ role: 'user', content: problemsText });
-          modelMessages = trimChatMessagesForModel(modelMessages, historyLimit);
-          chatState.messages = uiMessages;
-          postChatState();
-          continue;
-        }
-      }
-      setAgentContinuation(null);
-      uiMessages.push({ role: 'assistant', content: 'All TODO items completed.' });
-      chatState.messages = uiMessages;
-      return 'success';
-    }
-    // Keep looping to execute the next pending TODO.
-    continue;
+function isDuplicateEdit(normalizedCall) {
+  if (!TOOL_WRITE.has(normalizedCall.tool)) return false;
+  
+  const key = JSON.stringify({
+    tool: normalizedCall.tool,
+    path: normalizedCall.args?.path,
+    startLine: normalizedCall.args?.startLine,
+    endLine: normalizedCall.args?.endLine,
+    newText: normalizedCall.args?.newText || normalizedCall.args?.text || normalizedCall.args?.content
+  });
+  
+  const lastEdit = recentEdits.get(key);
+  if (lastEdit && (Date.now() - lastEdit) < EDIT_COOLDOWN_MS) {
+    return true;
   }
+  
+  return false;
+}
 
-  setAgentContinuation(modelMessages);
-  uiMessages.push({ role: 'assistant', content: 'Agent stopped: too many tool steps.' });
-  chatState.messages = uiMessages;
-  return 'failure';
+function recordEdit(normalizedCall) {
+  const key = JSON.stringify({
+    tool: normalizedCall.tool,
+    path: normalizedCall.args?.path,
+    startLine: normalizedCall.args?.startLine,
+    endLine: normalizedCall.args?.endLine,
+    newText: normalizedCall.args?.newText || normalizedCall.args?.text || normalizedCall.args?.content
+  });
+  
+  recentEdits.set(key, Date.now());
+  
+  // Clean up old entries
+  if (recentEdits.size > 50) {
+    const oldestKey = recentEdits.keys().next().value;
+    recentEdits.delete(oldestKey);
+  }
+}
+
+const { AgentStrategy, AgentContext, ChatStrategy, ChatContext, PlannerStrategy, PlannerContext } = require('./agent');
+
+async function runAgentTurn(baseMessages, modelMessagesSeed) {
+  const workspaceRoot = getWorkspaceRoot();
+  
+  // Create agent context with dependency injection
+  const context = new AgentContext({
+    baseMessages,
+    modelMessages: modelMessagesSeed,
+    deps: {
+      // Configuration
+      getAgentMaxSteps,
+      getAgentPrePlanMaxSteps,
+      getChatHistoryCharLimit,
+      getDebugLoopMaxIterations,
+      shouldSkipFeatureMapping,
+      
+      // State access
+      chatState,
+      stopRequested: () => stopRequested,
+      clearStopFlag: () => { stopRequested = false; chatBusy = false; },
+      
+      // LLM interaction (callModelForChat is the main one, callLLM is an alias for ReAct phases)
+      callModelForChat,
+      callLLM: async (messages, optionsOrMode = {}) => {
+        // Wrapper for ReAct phases that expect different signatures:
+        // 1. callLLM(messages, { temperature, max_tokens })
+        // 2. callLLM(messages, mode)
+        // -> callModelForChat({ messages, mode, context })
+        
+        // Handle both object options and string mode
+        const mode = typeof optionsOrMode === 'string' ? optionsOrMode : 'agent';
+        
+        return await callModelForChat({
+          messages: Array.isArray(messages) ? messages : [],
+          mode: mode,
+          context: chatState.contexts || []
+        });
+      },
+      trimChatMessagesForModel,
+      
+      // Streaming helpers
+      streamMarkdown: async (markdown) => {
+        // Add markdown content to chat UI messages
+        // Ensure messages array exists
+        if (!chatState.messages) {
+          chatState.messages = [];
+        }
+        chatState.messages.push({
+          role: 'assistant',
+          content: markdown
+        });
+        postChatState();
+      },
+      
+      // Tool execution
+      runToolCall,
+      getToolRunner,
+      
+      // Plan management
+      applyPlanUpdate,
+      
+      // State updates
+      postChatState,
+      setAgentContinuation,
+      
+      // Memory and diagnostics
+      isAgentMemoryEnabled,
+      appendAgentMemory,
+      formatAgentOutcome: (messages, finalText) => {
+        // Format outcome for memory storage
+        return `Agent completed task: ${finalText.slice(0, 200)}`;
+      },
+      collectWorkspaceProblems,
+      
+      // ReAct + Evidence Ladder
+      getWorkspaceRoot: () => workspaceRoot,
+      discoverTestCommand: async () => {
+        try {
+          return await discoverTestCommand(workspaceRoot, async (filePath) => {
+            const uri = vscode.Uri.file(filePath);
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            return Buffer.from(bytes).toString('utf8');
+          });
+        } catch (err) {
+          return null;
+        }
+      },
+      discoverBuildCommand: async () => {
+        try {
+          return await discoverBuildCommand(
+            workspaceRoot,
+            async (filePath) => {
+              const uri = vscode.Uri.file(filePath);
+              const bytes = await vscode.workspace.fs.readFile(uri);
+              return Buffer.from(bytes).toString('utf8');
+            },
+            async (filePath) => {
+              try {
+                const uri = vscode.Uri.file(filePath);
+                await vscode.workspace.fs.stat(uri);
+                return true;
+              } catch {
+                return false;
+              }
+            }
+          );
+        } catch (err) {
+          return null;
+        }
+      },
+      parseTestOutput: (output, runner, exitCode) => {
+        try {
+          return parseTestOutput(output, runner, exitCode);
+        } catch (err) {
+          return { passed: exitCode === 0, error: String(err.message || err) };
+        }
+      },
+      parseBuildOutput: (output, tool, exitCode) => {
+        try {
+          return parseBuildOutput(output, tool, exitCode);
+        } catch (err) {
+          return { success: exitCode === 0, error: String(err.message || err) };
+        }
+      }
+    }
+  });
+  
+  // Create and run strategy
+  const strategy = new AgentStrategy();
+  const result = await strategy.run(context);
+  
+  return result;
+}
+
+async function runChatTurn(baseMessages, userText, threadId) {
+  const context = new ChatContext({
+    baseMessages,
+    modelMessages: baseMessages,
+    deps: {
+      // Configuration
+      getChatMaxSteps,
+      getChatHistoryCharLimit,
+      
+      // State access
+      chatState,
+      stopRequested: () => stopRequested,
+      clearStopFlag: () => { stopRequested = false; chatBusy = false; },
+      
+      // LLM interaction
+      callModelForChat,
+      trimChatMessagesForModel,
+      
+      // Tool execution
+      runToolCall,
+      getToolRunner,
+      describeToolCall,
+      
+      // Plan management
+      applyPlanUpdate,
+      
+      // State updates
+      postChatState,
+      setAgentContinuation,
+      
+      // Thread persistence
+      threadId,
+      addChatMessage,
+      touchChatThread,
+      refreshChatThreads,
+      
+      // Command context
+      buildDebuggerContextMessage,
+      buildSearchContextMessage,
+      buildSymbolsContextMessage,
+      buildProblemsContextMessage,
+      
+      // Smart search
+      searchWorkspaceSymbols,
+      PREFERRED_SYMBOL_KINDS,
+      isNoiseSymbol,
+      formatSymbolResultMarkdown,
+      runToolWithSugar,
+      formatToolResultForUi
+    }
+  });
+  
+  const strategy = new ChatStrategy(userText);
+  const result = await strategy.run(context);
+  
+  return result;
+}
+
+async function runPlannerTurn(baseMessages, userText, threadId) {
+  const context = new PlannerContext({
+    baseMessages,
+    modelMessages: baseMessages,
+    deps: {
+      // Configuration
+      getChatMaxSteps,
+      getChatHistoryCharLimit,
+      
+      // State access
+      chatState,
+      stopRequested: () => stopRequested,
+      clearStopFlag: () => { stopRequested = false; chatBusy = false; },
+      
+      // LLM interaction
+      callModelForChat,
+      trimChatMessagesForModel,
+      
+      // Tool execution
+      runToolCall,
+      getToolRunner,
+      describeToolCall,
+      
+      // Plan management
+      applyPlanUpdate,
+      
+      // State updates
+      postChatState,
+      setAgentContinuation,
+      
+      // Thread persistence
+      threadId,
+      addChatMessage,
+      touchChatThread,
+      refreshChatThreads,
+      
+      // Command context
+      buildDebuggerContextMessage,
+      buildSearchContextMessage,
+      buildSymbolsContextMessage,
+      buildProblemsContextMessage,
+      
+      // Smart search
+      searchWorkspaceSymbols,
+      PREFERRED_SYMBOL_KINDS,
+      isNoiseSymbol,
+      formatSymbolResultMarkdown,
+      runToolWithSugar,
+      formatToolResultForUi
+    }
+  });
+  
+  const strategy = new PlannerStrategy(userText);
+  const result = await strategy.run(context);
+  
+  return result;
 }
 
 async function runToolCall(call) {
@@ -3296,279 +2733,6 @@ async function getChatHtml(webview) {
   return html;
 }
 
-function ensureSqliteAvailable() {
-  if (chatDbUnavailable) return false;
-  if (!sqlite3) {
-    chatDbUnavailable = true;
-    vscode.window.showErrorMessage('CodeCritic: sqlite3 dependency not available. Run npm install in the extension folder.');
-    return false;
-  }
-  return true;
-}
-
-async function ensureChatDbReady() {
-  if (!ensureSqliteAvailable()) return false;
-  if (!extensionContext) return false;
-  if (!chatDbReady) {
-    chatDbReady = initChatDb(extensionContext);
-  }
-  try {
-    await chatDbReady;
-    return true;
-  } catch (err) {
-    const out = getOutputChannel();
-    out.appendLine(`CodeCritic chat DB init failed: ${String(err && err.message ? err.message : err)}`);
-    out.show(true);
-    return false;
-  }
-}
-
-async function initChatDb(context) {
-  await vscode.workspace.fs.createDirectory(context.globalStorageUri);
-  const dbPath = path.join(context.globalStorageUri.fsPath, 'chat.db');
-  chatDb = new sqlite3.Database(dbPath);
-  await dbRun('PRAGMA foreign_keys = ON');
-  await dbRun('PRAGMA journal_mode = WAL');
-  await dbRun(
-    'CREATE TABLE IF NOT EXISTS chat_threads (' +
-      'id INTEGER PRIMARY KEY AUTOINCREMENT,' +
-      'title TEXT NOT NULL,' +
-      'context_json TEXT,' +
-      'todo_json TEXT,' +
-      'plan_json TEXT,' +
-      'created_at TEXT NOT NULL,' +
-      'updated_at TEXT NOT NULL' +
-    ')'
-  );
-  await dbRun(
-    'CREATE TABLE IF NOT EXISTS chat_messages (' +
-      'id INTEGER PRIMARY KEY AUTOINCREMENT,' +
-      'thread_id INTEGER NOT NULL,' +
-      'role TEXT NOT NULL,' +
-      'content TEXT NOT NULL,' +
-      'created_at TEXT NOT NULL,' +
-      'FOREIGN KEY(thread_id) REFERENCES chat_threads(id) ON DELETE CASCADE' +
-    ')'
-  );
-  await dbRun('CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_id ON chat_messages(thread_id)');
-
-  try {
-    const columns = await dbAll("PRAGMA table_info('chat_threads')");
-    const hasTodo = columns.some((col) => col && col.name === 'todo_json');
-    if (!hasTodo) {
-      await dbRun('ALTER TABLE chat_threads ADD COLUMN todo_json TEXT');
-    }
-    const hasPlan = columns.some((col) => col && col.name === 'plan_json');
-    if (!hasPlan) {
-      await dbRun('ALTER TABLE chat_threads ADD COLUMN plan_json TEXT');
-    }
-  } catch {
-    // ignore migration errors
-  }
-
-  const storedId = context.globalState.get('codeCritic.activeChatThreadId');
-  if (storedId) {
-    activeChatThreadId = String(storedId);
-  }
-}
-
-function dbRun(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    if (!chatDb) return reject(new Error('Chat DB not initialized.'));
-    chatDb.run(sql, params, function(err) {
-      if (err) return reject(err);
-      resolve(this);
-    });
-  });
-}
-
-function dbGet(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    if (!chatDb) return reject(new Error('Chat DB not initialized.'));
-    chatDb.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      resolve(row);
-    });
-  });
-}
-
-function dbAll(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    if (!chatDb) return reject(new Error('Chat DB not initialized.'));
-    chatDb.all(sql, params, (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows || []);
-    });
-  });
-}
-
-function defaultChatTitle() {
-  const iso = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
-  return `Chat ${iso}`;
-}
-
-function normalizeThreadId(value) {
-  const num = Number(value);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  return String(Math.floor(num));
-}
-
-async function ensureChatReady() {
-  const ok = await ensureChatDbReady();
-  if (!ok) return;
-
-  await refreshChatThreads();
-  if (!activeChatThreadId || !chatThreads.find((t) => t.id === activeChatThreadId)) {
-    const first = chatThreads[0];
-    activeChatThreadId = first ? first.id : null;
-  }
-  if (!activeChatThreadId) {
-    activeChatThreadId = await createChatThread({ title: defaultChatTitle(), context: null, todos: [], plan: [] });
-  }
-  if (activeChatThreadId) {
-    await loadChatThread(activeChatThreadId);
-    await persistActiveChatThreadId();
-  }
-}
-
-async function persistActiveChatThreadId() {
-  if (!extensionContext) return;
-  await extensionContext.globalState.update('codeCritic.activeChatThreadId', activeChatThreadId);
-}
-
-async function refreshChatThreads() {
-  if (!chatDb) return;
-  const rows = await dbAll(
-    'SELECT id, title, updated_at FROM chat_threads ORDER BY datetime(updated_at) DESC, id DESC'
-  );
-  chatThreads = rows.map((row) => ({
-    id: String(row.id),
-    title: row.title || defaultChatTitle(),
-    updatedAt: String(row.updated_at || '')
-  }));
-}
-
-async function createChatThread({ title, context, todos, plan }) {
-  if (!chatDb) return null;
-  const now = new Date().toISOString();
-  const safeTitle = String(title || defaultChatTitle()).trim() || defaultChatTitle();
-  const ctxJson = context ? JSON.stringify(context) : null;
-  const todoJson = todos && todos.length ? JSON.stringify(todos) : null;
-  const planJson = plan && plan.length ? JSON.stringify(plan) : null;
-  const info = await dbRun(
-    'INSERT INTO chat_threads (title, context_json, todo_json, plan_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-    [safeTitle, ctxJson, todoJson, planJson, now, now]
-  );
-  const id = info && info.lastID ? String(info.lastID) : null;
-  if (id) {
-    activeChatThreadId = id;
-    await persistActiveChatThreadId();
-  }
-  await refreshChatThreads();
-  return id;
-}
-
-async function loadChatThread(threadId) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const row = await dbGet('SELECT id, title, context_json, todo_json, plan_json FROM chat_threads WHERE id = ?', [normId]);
-  if (!row) return;
-  const rows = await dbAll(
-    'SELECT role, content FROM chat_messages WHERE thread_id = ? ORDER BY id ASC',
-    [normId]
-  );
-  chatState.messages = rows.map((msg) => ({
-    role: msg.role === 'assistant' ? 'assistant' : 'user',
-    content: String(msg.content || '')
-  }));
-  const parsed = row.context_json ? safeJsonParse(row.context_json) : null;
-  chatState.contexts = normalizeContextList(parsed);
-  const todoParsed = row.todo_json ? safeJsonParse(row.todo_json) : null;
-  chatState.todos = normalizeTodoList(todoParsed || []);
-  const planParsed = row.plan_json ? safeJsonParse(row.plan_json) : null;
-  chatState.plan = normalizePlanList(planParsed || []);
-  chatState.approvals = [];
-}
-
-async function selectChatThread(threadId) {
-  await ensureChatReady();
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  activeChatThreadId = normId;
-  await persistActiveChatThreadId();
-  await loadChatThread(normId);
-  postChatState();
-}
-
-async function clearChatMessages(threadId) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  await dbRun('DELETE FROM chat_messages WHERE thread_id = ?', [normId]);
-}
-
-async function updateChatThreadContext(threadId, context) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const ctxJson = context ? JSON.stringify(context) : null;
-  await dbRun('UPDATE chat_threads SET context_json = ? WHERE id = ?', [ctxJson, normId]);
-}
-
-async function updateChatThreadTodos(threadId, todos) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const todoJson = todos && todos.length ? JSON.stringify(todos) : null;
-  await dbRun('UPDATE chat_threads SET todo_json = ? WHERE id = ?', [todoJson, normId]);
-}
-
-async function updateChatThreadPlan(threadId, plan) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const planJson = plan && plan.length ? JSON.stringify(plan) : null;
-  await dbRun('UPDATE chat_threads SET plan_json = ? WHERE id = ?', [planJson, normId]);
-}
-
-async function touchChatThread(threadId) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const now = new Date().toISOString();
-  await dbRun('UPDATE chat_threads SET updated_at = ? WHERE id = ?', [now, normId]);
-}
-
-async function addChatMessage(threadId, role, content) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const now = new Date().toISOString();
-  await dbRun(
-    'INSERT INTO chat_messages (thread_id, role, content, created_at) VALUES (?, ?, ?, ?)',
-    [normId, role, String(content || ''), now]
-  );
-}
-
-async function maybeUpdateThreadTitleFromMessage(threadId, message) {
-  if (!chatDb) return;
-  const normId = normalizeThreadId(threadId);
-  if (!normId) return;
-  const row = await dbGet('SELECT title FROM chat_threads WHERE id = ?', [normId]);
-  if (!row || !row.title) return;
-  if (!isDefaultChatTitle(row.title)) return;
-  const candidate = String(message || '').trim();
-  if (!candidate) return;
-  const title = candidate.length > 60 ? `${candidate.slice(0, 57)}...` : candidate;
-  await dbRun('UPDATE chat_threads SET title = ? WHERE id = ?', [title, normId]);
-}
-
-function isDefaultChatTitle(title) {
-  const trimmed = String(title || '').trim();
-  return trimmed === 'Chat' || trimmed.startsWith('Chat ');
-}
-
 function trimChatMessagesForModel(messages, maxChars) {
   const limit = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 0;
   if (!Array.isArray(messages) || !messages.length) return [];
@@ -3576,22 +2740,87 @@ function trimChatMessagesForModel(messages, maxChars) {
     return [messages[messages.length - 1]];
   }
 
-  const out = [];
-  let total = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
+  // Smart trimming: preserve critical messages, aggressively trim tool results
+  const critical = [];
+  const optional = [];
+  const recent = [];
+  
+  const recentThreshold = Math.max(0, messages.length - 5);
+  
+  for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const content = String(msg && msg.content ? msg.content : '');
-    if (i === messages.length - 1 && content.length > limit) {
-      out.push({ ...msg, content: content.slice(-limit) });
-      total = limit;
-      break;
+    
+    // Always keep recent messages
+    if (i >= recentThreshold) {
+      recent.push(msg);
+      continue;
     }
-    if (total + content.length > limit) continue;
-    out.push(msg);
-    total += content.length;
-    if (total >= limit) break;
+    
+    // Preserve critical message types
+    if (msg.role === 'user' ||
+        content.includes('Execution Plan') ||
+        content.includes('Workspace problems') ||
+        content.startsWith('Outcome @') ||
+        (content.startsWith('Tool result (problems)')) ||
+        (i === 0)) {
+      critical.push(msg);
+    } else if (content.startsWith('Tool result') || content.startsWith('Tool call:')) {
+      // Tool results are optional, can be trimmed first
+      // Compress long tool results
+      if (content.length > 1000) {
+        const lines = content.split('\n');
+        const header = lines[0];
+        const truncated = lines.slice(1, 6).join('\n');
+        optional.push({ ...msg, content: `${header}\n${truncated}\n...[trimmed ${content.length} chars]` });
+      } else {
+        optional.push(msg);
+      }
+    } else {
+      critical.push(msg);
+    }
   }
-  return out.reverse();
+  
+  // Calculate sizes
+  let criticalSize = critical.reduce((sum, m) => sum + String(m.content || '').length, 0);
+  const recentSize = recent.reduce((sum, m) => sum + String(m.content || '').length, 0);
+  const remaining = limit - criticalSize - recentSize;
+  
+  // Include as many optional messages as fit
+  const included = [];
+  let optionalSize = 0;
+  for (const msg of optional.reverse()) {
+    const size = String(msg.content || '').length;
+    if (optionalSize + size <= remaining) {
+      included.unshift(msg);
+      optionalSize += size;
+    }
+  }
+  
+  const result = [...critical, ...included, ...recent];
+  
+  // Final size check - if still too large, trim from optional
+  const totalSize = result.reduce((sum, m) => sum + String(m.content || '').length, 0);
+  if (totalSize > limit) {
+    const out = [];
+    let total = 0;
+    for (let i = result.length - 1; i >= 0; i--) {
+      const msg = result[i];
+      const content = String(msg && msg.content ? msg.content : '');
+      if (i === result.length - 1 && content.length > limit) {
+        out.push({ ...msg, content: content.slice(-limit) });
+        total = limit;
+        break;
+      }
+      if (total + content.length > limit) continue;
+      out.push(msg);
+      total += content.length;
+      if (total >= limit) break;
+    }
+    return out.reverse();
+  }
+  
+  return result;
 }
 
 module.exports = {

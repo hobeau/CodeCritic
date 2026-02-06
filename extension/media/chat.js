@@ -1,3 +1,4 @@
+console.log('=== CHAT.JS LOADED ===');
 window.onerror = function(message) {
   const statusEl = document.getElementById('status');
   if (statusEl && message) {
@@ -13,8 +14,16 @@ const inputEl = document.getElementById('input');
 const commandMenu = document.getElementById('commandMenu');
 const sendBtn = document.getElementById('send');
 const stopBtn = document.getElementById('stop');
-const threadSelect = document.getElementById('threadSelect');
+const threadTrigger = document.getElementById('threadTrigger');
+const threadTitleEl = document.getElementById('threadTitle');
+const threadDropdown = document.getElementById('threadDropdown');
+const threadSearchInput = document.getElementById('threadSearch');
+const threadClearBtn = document.getElementById('threadClear');
+const threadListEl = document.getElementById('threadList');
+const threadEmptyEl = document.getElementById('threadEmpty');
 const newChatBtn = document.getElementById('newChat');
+const deleteChatBtn = document.getElementById('deleteChat');
+console.log('deleteChatBtn element:', deleteChatBtn);
 const modelSelect = document.getElementById('modelSelect');
 const modeEl = document.getElementById('mode');
 const debugToggleBtn = document.getElementById('debugListen');
@@ -38,24 +47,33 @@ const statusEl = document.getElementById('status');
 let state = {
   mode: 'chat',
   contexts: [],
-  todos: [],
   plan: [],
   messages: [],
   busy: false,
   threads: [],
   activeThreadId: null,
+  activeThreadTitle: '',
+  threadFilter: '',
+  threadsFiltered: false,
+  threadsTotal: 0,
   debugListenEnabled: false,
   models: [],
-  activeModel: ''
+  activeModel: '',
+  awaitingHumanInput: false,
+  pendingQuestion: null,
+  markdownPlan: null
 };
 let activeTab = 'chat';
 let editingContextId = null;
 let composing = false;
+let threadDropdownOpen = false;
+let threadFilterTimer = null;
 
 const COMMANDS = [
   { command: '/debugger', description: 'Use debugger snapshot' },
   { command: '/search', description: 'Search workspace text' },
-  { command: '/symbols', description: 'Search workspace symbols' }
+  { command: '/symbols', description: 'Search workspace symbols' },
+  { command: '/problems', description: 'Show workspace errors' }
 ];
 const COMMAND_SET = new Set(COMMANDS.map((item) => item.command));
 let commandState = { open: false, items: [], activeIndex: 0, start: 0, end: 0 };
@@ -818,41 +836,172 @@ function renderApprovals() {
 function renderTodos() {
   if (!todosEl) return;
   todosEl.innerHTML = '';
-  const isAgent = state.mode === 'agent';
+  const isPlannerMode = state.mode === 'planner';
   const planItems = Array.isArray(state.plan) ? state.plan : [];
-  const todoItems = Array.isArray(state.todos) ? state.todos : [];
-  const items = isAgent ? todoItems : planItems;
+  
+  // Show awaiting human input indicator if applicable
+  if (state.awaitingHumanInput && state.pendingQuestion) {
+    renderAwaitingInput();
+    return;
+  }
+  
+  const items = planItems;
   if (!items.length) return;
+  
   const card = document.createElement('div');
   card.className = 'todo-card';
   const header = document.createElement('div');
   header.className = 'todo-header';
   const title = document.createElement('div');
   title.className = 'todo-title';
-  title.textContent = isAgent ? 'Todos' : 'Plan';
+  title.textContent = 'Plan';
   const closeBtn = document.createElement('button');
   closeBtn.className = 'todo-close';
   closeBtn.type = 'button';
   closeBtn.textContent = '×';
-  closeBtn.title = isAgent ? 'Clear todos' : 'Clear plan';
+  closeBtn.title = 'Clear plan';
   header.appendChild(title);
   header.appendChild(closeBtn);
   card.appendChild(header);
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const row = document.createElement('div');
     row.className = 'todo-item' + (item.status === 'done' ? ' done' : '');
+    row.dataset.itemId = item.id;
+    row.dataset.itemIndex = i;
+    
+    // Status pill (clickable for planner mode)
     const pill = document.createElement('span');
     pill.className = 'todo-pill';
-    pill.textContent = item.status === 'done' ? 'Done' : (isAgent ? 'Next' : 'Step');
-    const text = document.createElement('span');
-    text.textContent = item.text || '';
+    if (isPlannerMode) {
+      pill.className += ' clickable';
+      pill.title = 'Toggle status';
+    }
+    pill.textContent = item.status === 'done' ? '✓' : '○';
+    
+    // Text content (editable for planner mode)
+    const textWrapper = document.createElement('span');
+    textWrapper.className = 'todo-text';
+    
+    if (isPlannerMode) {
+      const textInput = document.createElement('input');
+      textInput.type = 'text';
+      textInput.className = 'todo-text-input';
+      textInput.value = item.text || '';
+      textInput.dataset.itemId = item.id;
+      textWrapper.appendChild(textInput);
+      
+      // Action buttons for planner mode
+      const actions = document.createElement('span');
+      actions.className = 'todo-actions';
+      
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'todo-action-btn';
+      deleteBtn.textContent = '✕';
+      deleteBtn.title = 'Delete item';
+      deleteBtn.dataset.itemId = item.id;
+      deleteBtn.dataset.action = 'delete';
+      
+      actions.appendChild(deleteBtn);
+      textWrapper.appendChild(actions);
+    } else {
+      const text = document.createElement('span');
+      text.textContent = item.text || '';
+      textWrapper.appendChild(text);
+    }
+    
     row.appendChild(pill);
-    row.appendChild(text);
+    row.appendChild(textWrapper);
     card.appendChild(row);
+  }
+  
+  // Add "new item" input for planner mode
+  if (isPlannerMode) {
+    const addRow = document.createElement('div');
+    addRow.className = 'todo-item add-item';
+    const addInput = document.createElement('input');
+    addInput.type = 'text';
+    addInput.className = 'todo-add-input';
+    addInput.placeholder = 'Add new step...';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'todo-add-btn';
+    addBtn.textContent = '+';
+    addBtn.title = 'Add item';
+    addRow.appendChild(addInput);
+    addRow.appendChild(addBtn);
+    card.appendChild(addRow);
   }
 
   todosEl.appendChild(card);
+}
+
+function renderCollapsiblePlan(content) {
+  // Extract the plan markdown (remove the wrapper)
+  const planMatch = content.match(/## 📋 Execution Plan\s+([\s\S]+?)(?:---|$)/);
+  const planContent = planMatch ? planMatch[1].trim() : content;
+  
+  return `
+    <details class="execution-plan-collapsible" open>
+      <summary class="execution-plan-header">📋 Execution Plan <span class="plan-toggle">▼</span></summary>
+      <div class="execution-plan-content">
+        ${marked.parse(planContent)}
+      </div>
+    </details>
+  `;
+}
+
+function renderAwaitingInput() {
+  if (!todosEl) return;
+  
+  const card = document.createElement('div');
+  card.className = 'todo-card awaiting-input';
+  
+  const header = document.createElement('div');
+  header.className = 'todo-header';
+  const title = document.createElement('div');
+  title.className = 'todo-title';
+  title.textContent = '⏸️ Awaiting Your Input';
+  header.appendChild(title);
+  card.appendChild(header);
+  
+  const content = document.createElement('div');
+  content.className = 'awaiting-input-content';
+  content.textContent = state.pendingQuestion || 'The agent is waiting for your response...';
+  card.appendChild(content);
+  
+  todosEl.appendChild(card);
+}
+
+function renderMarkdown(text) {
+  // Simple markdown rendering for plan display
+  if (!text) return '';
+  
+  let html = String(text)
+    // Headers
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    // Bold
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    // Italic
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    // Checkboxes
+    .replace(/^- \[x\] (.+)$/gm, '<div class="checkbox checked"><span class="check">✓</span> $1</div>')
+    .replace(/^- \[ \] (.+)$/gm, '<div class="checkbox"><span class="check">○</span> $1</div>')
+    // List items
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    // Code inline
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // Line breaks
+    .replace(/\n/g, '<br>');
+  
+  // Wrap list items in ul
+  html = html.replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>');
+  
+  return html;
 }
 
 function isToolMessage(content) {
@@ -941,6 +1090,33 @@ function buildToolBlock(contents, approvalItem) {
   return details;
 }
 
+function renderCollapsiblePlan(content) {
+  // Extract the plan content
+  const lines = content.split('\n');
+  let planContent = content;
+  
+  // Remove the wrapper text if present
+  if (content.includes('---')) {
+    const parts = content.split('---');
+    if (parts.length >= 3) {
+      planContent = parts[1] || content;
+    }
+  }
+  
+  return `
+    <details class="execution-plan-collapsible" open>
+      <summary class="execution-plan-header">
+        <span class="plan-icon">📋</span>
+        <span class="plan-title">Execution Plan</span>
+        <span class="plan-toggle">▼</span>
+      </summary>
+      <div class="execution-plan-content">
+        ${renderMarkdown(planContent)}
+      </div>
+    </details>
+  `;
+}
+
 function renderMessages(messages) {
   chatEl.innerHTML = '';
   const pendingApprovals = Array.isArray(state.approvals) ? [...state.approvals] : [];
@@ -963,11 +1139,23 @@ function renderMessages(messages) {
         group.push(next.content || '');
         j += 1;
       }
-      const approvalItem = isToolCall && pendingApprovals.length ? pendingApprovals.shift() : null;
+      // Find approval that matches this message index
+      const approvalItem = isToolCall ? pendingApprovals.find(a => a.messageIndex === i || a.messageIndex === -1) : null;
+      if (approvalItem) {
+        // Remove from pending list once matched
+        const idx = pendingApprovals.indexOf(approvalItem);
+        if (idx !== -1) pendingApprovals.splice(idx, 1);
+      }
       div.appendChild(buildToolBlock(group, approvalItem));
       i = j - 1;
     } else if (msg.role === 'assistant') {
-      div.innerHTML = renderMarkdown(content);
+      // Check if this is an execution plan message
+      if (content.includes('## 📋 Execution Plan') || content.includes('# ReAct Agent Execution Plan')) {
+        div.classList.add('execution-plan-message');
+        div.innerHTML = renderCollapsiblePlan(content);
+      } else {
+        div.innerHTML = renderMarkdown(content);
+      }
     } else {
       div.textContent = content;
     }
@@ -1067,21 +1255,13 @@ function render(nextState) {
       statusEl.textContent = state.busy ? 'Thinking...' : '';
     }
   }
-  const threads = Array.isArray(state.threads) ? state.threads : [];
-  if (threadSelect) {
-    threadSelect.innerHTML = '';
-    for (const thread of threads) {
-      const opt = document.createElement('option');
-      opt.value = thread.id;
-      opt.textContent = thread.title || 'Chat';
-      if (thread.id === state.activeThreadId) opt.selected = true;
-      threadSelect.appendChild(opt);
-    }
-    threadSelect.disabled = state.busy || threads.length === 0;
-  }
+  renderThreadPicker();
   renderModelSelect();
   if (newChatBtn) {
     newChatBtn.disabled = state.busy;
+  }
+  if (deleteChatBtn) {
+    deleteChatBtn.disabled = state.busy || !state.activeThreadId;
   }
   renderMessages(state.messages);
   updateSendState();
@@ -1114,6 +1294,93 @@ function parseOpenFileLink(href) {
   return { path, line: Number.isFinite(line) ? line : 1 };
 }
 
+function formatThreadTitle(title) {
+  const raw = String(title || '').trim();
+  return raw || 'Chat';
+}
+
+function setThreadDropdownOpen(nextOpen) {
+  threadDropdownOpen = Boolean(nextOpen);
+  if (threadDropdown) {
+    threadDropdown.classList.toggle('is-open', threadDropdownOpen);
+    threadDropdown.setAttribute('aria-hidden', threadDropdownOpen ? 'false' : 'true');
+  }
+  if (threadTrigger) {
+    threadTrigger.setAttribute('aria-expanded', threadDropdownOpen ? 'true' : 'false');
+  }
+  if (threadDropdownOpen && threadSearchInput) {
+    threadSearchInput.focus();
+  }
+}
+
+function requestThreadFilter(query) {
+  if (threadFilterTimer) {
+    clearTimeout(threadFilterTimer);
+    threadFilterTimer = null;
+  }
+  threadFilterTimer = setTimeout(() => {
+    postVsCodeMessage({ type: 'filterThreads', query: String(query || '') });
+  }, 180);
+}
+
+function renderThreadPicker() {
+  const threads = Array.isArray(state.threads) ? state.threads : [];
+  const activeId = state.activeThreadId ? String(state.activeThreadId) : '';
+  const activeTitle = formatThreadTitle(state.activeThreadTitle);
+  const busy = Boolean(state.busy);
+  if (threadDropdownOpen && (busy || threads.length === 0)) {
+    setThreadDropdownOpen(false);
+  }
+  if (threadTitleEl) {
+    threadTitleEl.textContent = activeTitle;
+  }
+  if (threadTrigger) {
+    threadTrigger.disabled = busy || threads.length === 0;
+  }
+  if (threadSearchInput) {
+    if (document.activeElement !== threadSearchInput) {
+      const nextValue = String(state.threadFilter || '');
+      if (threadSearchInput.value !== nextValue) {
+        threadSearchInput.value = nextValue;
+      }
+    }
+    threadSearchInput.disabled = busy;
+  }
+  if (threadClearBtn) {
+    threadClearBtn.disabled = busy || !String(state.threadFilter || '').trim();
+  }
+  if (threadListEl) {
+    threadListEl.innerHTML = '';
+    for (const thread of threads) {
+      const row = document.createElement('div');
+      row.className = 'thread-row';
+      row.dataset.threadId = String(thread.id);
+      if (String(thread.id) === activeId) row.classList.add('is-active');
+
+      const itemBtn = document.createElement('button');
+      itemBtn.type = 'button';
+      itemBtn.className = 'thread-item';
+      itemBtn.textContent = formatThreadTitle(thread.title);
+      itemBtn.disabled = busy;
+      itemBtn.addEventListener('click', () => {
+        const id = String(thread.id || '');
+        if (!id) return;
+        if (!postVsCodeMessage({ type: 'selectThread', threadId: id })) {
+          if (statusEl) statusEl.textContent = 'Unable to select thread';
+        }
+        setThreadDropdownOpen(false);
+      });
+
+      row.appendChild(itemBtn);
+      threadListEl.appendChild(row);
+    }
+  }
+  if (threadEmptyEl) {
+    const showEmpty = threads.length === 0;
+    threadEmptyEl.classList.toggle('is-visible', showEmpty);
+  }
+}
+
 window.addEventListener('message', (event) => {
   const msg = event.data;
   if (msg && msg.type === 'ping') {
@@ -1137,6 +1404,14 @@ document.addEventListener('click', (event) => {
   const target = event.target;
   if (!target) return;
 
+  if (threadDropdownOpen) {
+    const clickedInside = (threadDropdown && threadDropdown.contains(target)) ||
+      (threadTrigger && threadTrigger.contains(target));
+    if (!clickedInside) {
+      setThreadDropdownOpen(false);
+    }
+  }
+
   const previewBtn = target.closest('.preview-btn');
   if (previewBtn) {
     const wrapper = previewBtn.closest('.code-block-wrapper');
@@ -1159,11 +1434,49 @@ document.addEventListener('click', (event) => {
   const todoClose = target.closest('button.todo-close');
   if (todoClose) {
     if (!postVsCodeMessage({ type: 'clearTodos' })) {
-      const label = state.mode === 'agent' ? 'todos' : 'plan';
+      const label = 'plan';
       if (statusEl) statusEl.textContent = `Unable to clear ${label}`;
     }
     return;
   }
+  
+  // Plan item status toggle
+  const todoPill = target.closest('.todo-pill.clickable');
+  if (todoPill) {
+    const row = todoPill.closest('.todo-item');
+    if (row && row.dataset.itemId) {
+      if (!postVsCodeMessage({ type: 'togglePlanItemStatus', itemId: row.dataset.itemId })) {
+        if (statusEl) statusEl.textContent = 'Unable to update plan item';
+      }
+    }
+    return;
+  }
+  
+  // Plan item delete
+  const deleteBtn = target.closest('.todo-action-btn[data-action="delete"]');
+  if (deleteBtn && deleteBtn.dataset.itemId) {
+    if (!postVsCodeMessage({ type: 'deletePlanItem', itemId: deleteBtn.dataset.itemId })) {
+      if (statusEl) statusEl.textContent = 'Unable to delete plan item';
+    }
+    return;
+  }
+  
+  // Add new plan item
+  const addBtn = target.closest('.todo-add-btn');
+  if (addBtn) {
+    const addRow = addBtn.closest('.add-item');
+    const addInput = addRow ? addRow.querySelector('.todo-add-input') : null;
+    const text = addInput ? addInput.value.trim() : '';
+    if (text) {
+      if (!postVsCodeMessage({ type: 'addPlanItem', text })) {
+        if (statusEl) statusEl.textContent = 'Unable to add plan item';
+      } else {
+        addInput.value = '';
+      }
+    }
+    return;
+  }
+  
   const revertBtn = target.closest('button.tool-revert');
   if (revertBtn) {
     const id = revertBtn.dataset.revertId;
@@ -1269,13 +1582,32 @@ modeEl.addEventListener('change', () => {
   }
 });
 
-if (threadSelect) {
-  threadSelect.addEventListener('change', () => {
-    const selected = threadSelect.value;
-    if (selected) {
-      if (!postVsCodeMessage({ type: 'selectThread', threadId: selected })) {
-        if (statusEl) statusEl.textContent = 'Unable to select thread';
-      }
+if (threadTrigger) {
+  threadTrigger.addEventListener('click', () => {
+    if (threadTrigger.disabled) return;
+    setThreadDropdownOpen(!threadDropdownOpen);
+  });
+}
+
+if (threadSearchInput) {
+  threadSearchInput.addEventListener('input', () => {
+    requestThreadFilter(threadSearchInput.value);
+  });
+  threadSearchInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      setThreadDropdownOpen(false);
+      threadSearchInput.blur();
+    }
+  });
+}
+
+if (threadClearBtn) {
+  threadClearBtn.addEventListener('click', () => {
+    if (threadClearBtn.disabled) return;
+    if (threadSearchInput) {
+      threadSearchInput.value = '';
+      requestThreadFilter('');
+      threadSearchInput.focus();
     }
   });
 }
@@ -1301,6 +1633,17 @@ if (newChatBtn) {
   newChatBtn.addEventListener('click', () => {
     if (!postVsCodeMessage({ type: 'newThread' })) {
       if (statusEl) statusEl.textContent = 'Unable to create new chat';
+    }
+  });
+}
+
+if (deleteChatBtn) {
+  deleteChatBtn.addEventListener('click', () => {
+    const threadId = state.activeThreadId;
+    if (!threadId) return;
+    const threadTitle = state.activeThreadTitle || 'this chat';
+    if (!postVsCodeMessage({ type: 'confirmDeleteThread', threadId, threadTitle })) {
+      if (statusEl) statusEl.textContent = 'Unable to delete thread';
     }
   });
 }
@@ -1462,6 +1805,52 @@ if (inputEl) {
     updateSendState();
   });
 }
+
+// Event delegation for plan item text editing
+document.addEventListener('blur', (event) => {
+  const target = event.target;
+  if (target && target.classList && target.classList.contains('todo-text-input')) {
+    const itemId = target.dataset.itemId;
+    const newText = target.value.trim();
+    if (itemId && newText) {
+      if (!postVsCodeMessage({ type: 'updatePlanItem', itemId, text: newText })) {
+        if (statusEl) statusEl.textContent = 'Unable to update plan item';
+      }
+    }
+  }
+}, true);
+
+document.addEventListener('keydown', (event) => {
+  const target = event.target;
+  if (target && target.classList && target.classList.contains('todo-text-input')) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      target.blur();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      // Revert to original value
+      const itemId = target.dataset.itemId;
+      const planItem = state.plan.find(item => item.id === itemId);
+      if (planItem) {
+        target.value = planItem.text || '';
+      }
+      target.blur();
+    }
+  }
+  if (target && target.classList && target.classList.contains('todo-add-input')) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const text = target.value.trim();
+      if (text) {
+        if (!postVsCodeMessage({ type: 'addPlanItem', text })) {
+          if (statusEl) statusEl.textContent = 'Unable to add plan item';
+        } else {
+          target.value = '';
+        }
+      }
+    }
+  }
+});
 
 if (statusEl) statusEl.textContent = 'Chat UI ready';
 logUi('webview ready');

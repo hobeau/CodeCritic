@@ -274,6 +274,7 @@ function createToolRunner({
   const revertChanges = new Map();
   const revertOrder = [];
   const MAX_REVERTS = 40;
+  // (removed lastReadPath bandaid — normalizeAssistantResponse now extracts paths correctly)
 
   async function confirmAction({ title, details, approveLabel, cancelLabel }) {
     if (typeof requestApproval === 'function') {
@@ -342,6 +343,51 @@ function createToolRunner({
       const message = err && err.message ? err.message : String(err);
       const suffix = stderr ? `\n${stderr}` : '';
       return { ok: false, text: `Search failed: ${message}${suffix}`.trim() };
+    }
+  }
+
+  async function runWorkspaceScanSearch({ query, include, exclude, maxResults }) {
+    try {
+      const uris = await vscode.workspace.findFiles(include || '**/*', exclude || '**/node_modules/**', 5000);
+      const out = [];
+
+      for (const uri of uris) {
+        if (out.length >= maxResults) break;
+        if (!uri || !uri.fsPath) continue;
+
+        let bytes;
+        try {
+          bytes = await vscode.workspace.fs.readFile(uri);
+        } catch {
+          continue;
+        }
+
+        const buf = Buffer.from(bytes);
+        if (!buf.length) continue;
+        // Skip likely-binary files.
+        if (buf.includes(0)) continue;
+        // Skip very large files to avoid UI lockups.
+        if (buf.length > 1024 * 1024) continue;
+
+        const text = buf.toString('utf8');
+        if (!text.includes(query)) continue;
+
+        const lines = text.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i += 1) {
+          if (out.length >= maxResults) break;
+          const line = lines[i] || '';
+          if (!line.includes(query)) continue;
+          const rel = toWorkspaceRelativePath(uri.fsPath) || uri.fsPath;
+          out.push(`${rel}:${i + 1} | ${line.trim()}`);
+          break; // one match per file for compactness
+        }
+      }
+
+      if (!out.length) return { ok: true, text: 'Search results: no matches.' };
+      return { ok: true, text: `Search results (${out.length}):\n` + out.join('\n') };
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      return { ok: false, text: `Search failed: ${message}` };
     }
   }
 
@@ -460,6 +506,10 @@ function createToolRunner({
         if (fallback.ok) {
           return `${fallback.text}\n\nNote: findTextInFiles is unavailable; used ripgrep fallback.`;
         }
+        const scanFallback = await runWorkspaceScanSearch({ query, include, exclude, maxResults });
+        if (scanFallback.ok) {
+          return `${scanFallback.text}\n\nNote: findTextInFiles requires the proposed API; used workspace scan fallback.`;
+        }
         return `${fallback.text}\n\nNote: findTextInFiles requires the proposed API; enable it or run with --enable-proposed-api.`;
       }
       return `Search failed: ${message}`;
@@ -470,25 +520,61 @@ function createToolRunner({
   }
 
   async function toolReadFile(args) {
-    const fullPath = resolveWorkspacePathForTool(args.path);
-    if (!fullPath) return 'Read failed: invalid or out-of-workspace path.';
+    const stripLineRangeSuffix = (value) => String(value || '').replace(/\s+lines?\s+\d+\s*-\s*\d+\b/gi, '').trim();
+    const rawPath = stripLineRangeSuffix(String(args.path || '').trim());
+    let fullPath = resolveWorkspacePathForTool(rawPath);
+    const notes = [];
+
+    // No fallback — normalizeAssistantResponse should always extract paths correctly.
+    // If the LLM omits the path entirely, return a clear error so it can self-correct.
+
+    if (!fullPath) {
+      if (rawPath) return 'Read failed: invalid or out-of-workspace path.';
+      return 'Read failed: path is required (provide args.path or use locate_file to find it).';
+    }
 
     const maxChars = Math.max(200, Math.min(50000, Number(args.maxChars || 12000)));
-    let startLine = Number.isFinite(Number(args.startLine)) ? Math.max(1, Number(args.startLine)) : 1;
-    let endLine = Number.isFinite(Number(args.endLine)) ? Math.max(startLine, Number(args.endLine)) : 0;
+    const requestedStartLine = args.startLine;
+    const requestedEndLine = args.endLine;
 
     try {
       const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(fullPath));
       const text = Buffer.from(bytes).toString('utf8');
-      const lines = text.split(/\r?\n/);
+      const lines = text.length ? text.split(/\r?\n/) : [];
+      const lineCount = lines.length;
+      if (lineCount === 0) return 'Read: file is empty (0 lines).';
 
-      if (!endLine || endLine > lines.length) endLine = lines.length;
-      if (startLine > lines.length) return `Read failed: startLine exceeds file length (${lines.length}).`;
+      const rawStartLine = Number.isFinite(Number(requestedStartLine)) ? Math.trunc(Number(requestedStartLine)) : 1;
+      const rawEndLine = Number.isFinite(Number(requestedEndLine)) ? Math.trunc(Number(requestedEndLine)) : 0;
+
+      let startLine = rawStartLine;
+      if (startLine < 1) {
+        notes.push(`startLine clamped from ${startLine} to 1.`);
+        startLine = 1;
+      }
+
+      let endLine = rawEndLine;
+      if (endLine && endLine < startLine) {
+        notes.push(`endLine clamped from ${endLine} to ${startLine} (must be >= startLine).`);
+        endLine = startLine;
+      }
+
+      if (startLine > lineCount) {
+        const requestedRange = `${rawStartLine}-${rawEndLine || 'EOF'}`;
+        return `Read failed: requested lines ${requestedRange} but file has ${lineCount} lines (valid range: 1-${lineCount}).`;
+      }
+
+      if (!endLine || endLine > lineCount) {
+        if (Number.isFinite(Number(requestedEndLine)) && Number(requestedEndLine) > lineCount) {
+          notes.push(`endLine ${Number(requestedEndLine)} exceeds file length (${lineCount}); returned ${startLine}-${lineCount}.`);
+        }
+        endLine = lineCount;
+      }
 
       const slice = lines.slice(startLine - 1, endLine);
       const width = String(endLine).length;
       const numbered = slice.map((line, i) => `${String(startLine + i).padStart(width, ' ')} | ${line}`);
-      const out = numbered.join('\n');
+      const out = (notes.length ? `Note: ${notes.join(' ')}\n` : '') + numbered.join('\n');
 
       return limitToolOutput(out, maxChars);
     } catch (err) {
@@ -968,6 +1054,9 @@ function createToolRunner({
       const ok = await vscode.workspace.applyEdit(edit);
       if (!ok) return 'Edit failed: workspace edit was rejected.';
 
+      // Auto-save the file after applying the edit
+      await doc.save();
+
       const threadState = typeof getThreadState === 'function' ? getThreadState() : null;
       if (threadState && threadState.threadContext) {
         updateSelectionContextsForEdit(threadState.threadContext, doc.uri, doc, range, oldText, newText);
@@ -1031,6 +1120,9 @@ function createToolRunner({
       const ok = await vscode.workspace.applyEdit(edit);
       if (!ok) return 'Insert text failed: workspace edit rejected.';
 
+      // Auto-save the file after applying the edit
+      await doc.save();
+
       const threadState = typeof getThreadState === 'function' ? getThreadState() : null;
       if (threadState && threadState.threadContext) {
         updateSelectionContextsForEdit(threadState.threadContext, doc.uri, doc, new vscode.Range(position, position), '', text);
@@ -1093,6 +1185,9 @@ function createToolRunner({
       edit.replace(doc.uri, range, text);
       const ok = await vscode.workspace.applyEdit(edit);
       if (!ok) return 'Replace range failed: workspace edit rejected.';
+
+      // Auto-save the file after applying the edit
+      await doc.save();
 
       const threadState = typeof getThreadState === 'function' ? getThreadState() : null;
       if (threadState && threadState.threadContext) {
@@ -1190,14 +1285,14 @@ function createToolRunner({
         const diff = buildDiffBlock(existingContent, next);
         const suffix = diff ? `\n\n${diff}` : '';
         const revertId = registerRevertChange({
-          files: [{ path: fullPath, existed, content: existingContent }]
+          files: [{ path: fullPath, existed: exists, content: existingContent }]
         });
         const revertTag = formatRevertTag(revertId);
         return `Write appended to ${rel}.${suffix}${revertTag}`;
       }
 
       if (exists && !overwrite) {
-        return `Write failed: ${rel} already exists (set overwrite=true).`;
+        return `Write failed: ${rel} already exists. Either:\n1. Use edit_file to replace the content: {"tool":"edit_file","args":{"path":"${rel}","content":"...full replacement..."}}\n2. Re-issue write_file with overwrite=true: {"tool":"write_file","args":{"path":"${rel}","content":"...","overwrite":true}}`;
       }
 
       if (exists) {
@@ -1212,7 +1307,7 @@ function createToolRunner({
       const diff = buildDiffBlock(existingContent, content);
       const suffix = diff ? `\n\n${diff}` : '';
       const revertId = registerRevertChange({
-        files: [{ path: fullPath, existed, content: existingContent }]
+        files: [{ path: fullPath, existed: exists, content: existingContent }]
       });
       const revertTag = formatRevertTag(revertId);
       return `Write succeeded: ${rel}.${suffix}${revertTag}`;

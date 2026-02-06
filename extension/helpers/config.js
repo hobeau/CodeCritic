@@ -32,9 +32,28 @@ function getAgentMaxSteps() {
   return Math.max(1, Math.min(50, Math.floor(raw)));
 }
 
+function getAgentPrePlanMaxSteps() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  const raw = Number(cfg.get('agentPrePlanMaxSteps', 3));
+  if (!Number.isFinite(raw)) return 3;
+  return Math.max(1, Math.min(20, Math.floor(raw)));
+}
+
+function getChatMaxSteps() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  const raw = Number(cfg.get('chatMaxSteps', 6));
+  if (!Number.isFinite(raw)) return 6;
+  return Math.max(1, Math.min(50, Math.floor(raw)));
+}
+
 function isAgentMemoryEnabled() {
   const cfg = vscode.workspace.getConfiguration('codeCritic');
   return Boolean(cfg.get('agentMemoryEnabled', true));
+}
+
+function getCodeReviewInstructionFile() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  return String(cfg.get('codeReviewInstructionFile', ''));
 }
 
 function getAgentMemoryCharLimit() {
@@ -42,6 +61,18 @@ function getAgentMemoryCharLimit() {
   const raw = Number(cfg.get('agentMemoryChars', 6000));
   if (!Number.isFinite(raw)) return 6000;
   return Math.max(0, Math.floor(raw));
+}
+
+function getDebugLoopMaxIterations() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  const raw = Number(cfg.get('debugLoopMaxIterations', 5));
+  if (!Number.isFinite(raw)) return 5;
+  return Math.max(1, Math.min(20, Math.floor(raw)));
+}
+
+function shouldSkipFeatureMapping() {
+  const cfg = vscode.workspace.getConfiguration('codeCritic');
+  return Boolean(cfg.get('skipFeatureMappingForSimpleTasks', true));
 }
 
 function getAdoConfig() {
@@ -61,7 +92,12 @@ module.exports = {
   getMethodReviewConfig,
   getChatHistoryCharLimit,
   getAgentMaxSteps,
+  getAgentPrePlanMaxSteps,
+  getChatMaxSteps,
   isAgentMemoryEnabled,
   getAgentMemoryCharLimit,
+  getCodeReviewInstructionFile,
+  getDebugLoopMaxIterations,
+  shouldSkipFeatureMapping,
   getAdoConfig
 };
