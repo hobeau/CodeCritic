@@ -34,4 +34,25 @@ describe('AgentContext', () => {
   it.todo('should track workspace problems collection');
   
   it.todo('should provide summary of context state');
+
+  it('should initialize consecutiveFailures to 0', () => {
+    const ctx = new AgentContext({
+      baseMessages: [],
+      modelMessages: [],
+      deps: {}
+    });
+    expect(ctx.consecutiveFailures).toBe(0);
+  });
+
+  it('should allow incrementing and resetting consecutiveFailures', () => {
+    const ctx = new AgentContext({
+      baseMessages: [],
+      modelMessages: [],
+      deps: {}
+    });
+    ctx.consecutiveFailures = 3;
+    expect(ctx.consecutiveFailures).toBe(3);
+    ctx.consecutiveFailures = 0;
+    expect(ctx.consecutiveFailures).toBe(0);
+  });
 });

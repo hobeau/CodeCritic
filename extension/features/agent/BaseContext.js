@@ -35,6 +35,9 @@ class BaseContext {
     // Tool execution tracking
     this.executedTools = [];
     
+    // Phase data carrier (passes data between phases in loop)
+    this.data = {};
+    
     // Injected dependencies
     this.deps = deps || {};
   }

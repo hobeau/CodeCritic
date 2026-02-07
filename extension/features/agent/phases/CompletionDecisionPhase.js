@@ -64,6 +64,15 @@ class CompletionDecisionPhase {
     const requirements = getAcceptanceCheckRequirements(parsedPlan);
     const didMutate = this.didMutate(context);
 
+    // NEW: Guard for continuous plan refinement
+    // If plan was just reflected and changed, continue to validate changes
+    if (context.planReflected && context.planChanged) {
+      return PhaseResult.continue({
+        skippedCompletionCheck: true,
+        reason: 'Plan was recently updated - continuing to validate changes'
+      });
+    }
+
     // Perform completion checks
     const checks = {
       acceptanceChecksSatisfied: this.checkAcceptanceCriteria(parsedPlan, evidence, baseline),
@@ -142,10 +151,19 @@ class CompletionDecisionPhase {
       return { passed: false, reason: 'No acceptance checks defined' };
     }
 
-    // Check if all marked as checked
-    const allChecked = areAllAcceptanceChecksSatisfied(parsedPlan);
+    // NEW: Filter out soft-deleted acceptance checks ([REMOVED] prefix)
+    const activeChecks = parsedPlan.acceptanceChecks.filter(c => 
+      !c.text.startsWith('[REMOVED]')
+    );
+    
+    if (activeChecks.length === 0) {
+      return { passed: false, reason: 'No active acceptance checks defined' };
+    }
+
+    // Check if all active checks are marked as checked
+    const allChecked = activeChecks.every(c => c.checked);
     if (!allChecked) {
-      const unchecked = parsedPlan.acceptanceChecks.filter(c => !c.checked);
+      const unchecked = activeChecks.filter(c => !c.checked);
       return { 
         passed: false, 
         reason: `${unchecked.length} acceptance check(s) not satisfied: ${unchecked.map(c => c.text).join(', ')}`

@@ -229,12 +229,15 @@ function buildMarkdownPlan(plan) {
 
 /**
  * Get pending (unchecked) tasks from plan
+ * Filters out tasks marked with [REMOVED] prefix (soft-deleted)
  * @param {object} plan - Parsed plan object
  * @returns {Array} Array of pending tasks
  */
 function getPendingTasks(plan) {
   if (!plan || !Array.isArray(plan.tasks)) return [];
-  return plan.tasks.filter(task => !task.checked);
+  return plan.tasks.filter(task => 
+    !task.checked && !task.title.startsWith('[REMOVED]')
+  );
 }
 
 /**
@@ -419,6 +422,157 @@ function createEmptyPlan() {
   };
 }
 
+// ===== NEW UTILITIES FOR CONTINUOUS PLAN REFINEMENT =====
+
+/**
+ * Add a new task to the plan
+ * Task is appended to the end of the task list
+ * @param {object} plan - Parsed plan object
+ * @param {object} taskSpec - Task specification {title, description, doneWhen}
+ * @returns {object} Updated plan
+ */
+function addTask(plan, taskSpec) {
+  if (!plan) return plan;
+  if (!Array.isArray(plan.tasks)) plan.tasks = [];
+  
+  const { title, description = '', doneWhen = '' } = taskSpec;
+  if (!title || typeof title !== 'string') {
+    throw new Error('Task title is required');
+  }
+  
+  // Generate next task ID
+  const existingIds = plan.tasks.map(t => {
+    const match = t.id.match(/^T(\d+)$/);
+    return match ? parseInt(match[1], 10) : 0;
+  });
+  const nextNum = Math.max(0, ...existingIds) + 1;
+  const taskId = `T${nextNum}`;
+  
+  plan.tasks.push({
+    id: taskId,
+    checked: false,
+    title: String(title).trim(),
+    description: String(description).trim(),
+    doneWhen: String(doneWhen).trim()
+  });
+  
+  return plan;
+}
+
+/**
+ * Remove a task from the plan using soft-delete
+ * Task title is prefixed with [REMOVED] and marked as checked
+ * This preserves audit trail while filtering it from active tasks
+ * @param {object} plan - Parsed plan object
+ * @param {string} taskId - Task ID (e.g., "T1")
+ * @returns {object} Updated plan
+ */
+function removeTask(plan, taskId) {
+  if (!plan || !Array.isArray(plan.tasks)) return plan;
+  
+  const task = plan.tasks.find(t => t.id === taskId);
+  if (!task) {
+    throw new Error(`Task ${taskId} not found`);
+  }
+  
+  // Soft-delete: prefix with [REMOVED] and mark checked
+  if (!task.title.startsWith('[REMOVED]')) {
+    task.title = `[REMOVED] ${task.title}`;
+  }
+  task.checked = true;
+  
+  return plan;
+}
+
+/**
+ * Add a new acceptance check to the plan
+ * Check is appended to the end of the acceptance checks list
+ * @param {object} plan - Parsed plan object
+ * @param {string} text - Acceptance check text
+ * @returns {object} Updated plan
+ */
+function addAcceptanceCheck(plan, text) {
+  if (!plan) return plan;
+  if (!Array.isArray(plan.acceptanceChecks)) plan.acceptanceChecks = [];
+  
+  if (!text || typeof text !== 'string') {
+    throw new Error('Acceptance check text is required');
+  }
+  
+  plan.acceptanceChecks.push({
+    checked: false,
+    text: String(text).trim()
+  });
+  
+  return plan;
+}
+
+/**
+ * Remove an acceptance check from the plan using soft-delete
+ * Check text is prefixed with [REMOVED] and marked as checked
+ * @param {object} plan - Parsed plan object
+ * @param {string} text - Acceptance check text (exact match)
+ * @returns {object} Updated plan
+ */
+function removeAcceptanceCheck(plan, text) {
+  if (!plan || !Array.isArray(plan.acceptanceChecks)) return plan;
+  
+  const check = plan.acceptanceChecks.find(c => c.text === text);
+  if (!check) {
+    throw new Error(`Acceptance check "${text}" not found`);
+  }
+  
+  // Soft-delete: prefix with [REMOVED] and mark checked
+  if (!check.text.startsWith('[REMOVED]')) {
+    check.text = `[REMOVED] ${check.text}`;
+  }
+  check.checked = true;
+  
+  return plan;
+}
+
+/**
+ * Revise an acceptance check's text
+ * Finds check by original text and replaces with new text
+ * @param {object} plan - Parsed plan object
+ * @param {string} originalText - Original acceptance check text
+ * @param {string} newText - New acceptance check text
+ * @returns {object} Updated plan
+ */
+function reviseAcceptanceCheck(plan, originalText, newText) {
+  if (!plan || !Array.isArray(plan.acceptanceChecks)) return plan;
+  
+  if (!newText || typeof newText !== 'string') {
+    throw new Error('New acceptance check text is required');
+  }
+  
+  const check = plan.acceptanceChecks.find(c => c.text === originalText);
+  if (!check) {
+    throw new Error(`Acceptance check "${originalText}" not found`);
+  }
+  
+  check.text = String(newText).trim();
+  // Reset checked state since criteria changed
+  check.checked = false;
+  
+  return plan;
+}
+
+/**
+ * Update the scope boundaries in the plan header
+ * @param {object} plan - Parsed plan object
+ * @param {string} newScope - New scope text
+ * @returns {object} Updated plan
+ */
+function updateScope(plan, newScope) {
+  if (!plan) return plan;
+  if (!plan.header) plan.header = {};
+  
+  plan.header.scope = String(newScope || '').trim();
+  
+  return plan;
+}
+
 module.exports = {
   parseMarkdownPlan,
   buildMarkdownPlan,
@@ -431,5 +585,12 @@ module.exports = {
   areAllAcceptanceChecksSatisfied,
   areAllTasksComplete,
   getAcceptanceCheckRequirements,
-  createEmptyPlan
+  createEmptyPlan,
+  // Continuous plan refinement utilities
+  addTask,
+  removeTask,
+  addAcceptanceCheck,
+  removeAcceptanceCheck,
+  reviseAcceptanceCheck,
+  updateScope
 };

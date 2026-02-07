@@ -6,12 +6,24 @@
  *   acceptanceChecks?: [{ text: string, checked: boolean }],
  *   tasks?: [{ id: string, checked: boolean }],
  *   findings?: { entryPoints?, dataFlow?, invariants?, assumptions?, openQuestions? },
- *   progressLogEntry?: string
+ *   progressLogEntry?: string,
+ *   // NEW: Structural plan modifications (continuous plan refinement)
+ *   addTasks?: [{ title: string, description?: string, doneWhen: string }],
+ *   removeTasks?: [string], // Task IDs to soft-delete
+ *   reviseAcceptanceChecks?: [{ action: 'add'|'remove'|'revise', originalText?: string, newText?: string }]
  * }
  */
 
 const { PhaseResult } = require('../PhaseResult');
-const { addProgressLogEntry, updateFindings } = require('../utils/MarkdownPlanManager');
+const { 
+  addProgressLogEntry, 
+  updateFindings,
+  addTask,
+  removeTask,
+  addAcceptanceCheck,
+  removeAcceptanceCheck,
+  reviseAcceptanceCheck
+} = require('../utils/MarkdownPlanManager');
 
 function normalizeText(value) {
   return String(value || '')
@@ -91,6 +103,55 @@ class MarkdownPlanUpdatePhase {
       const { plan: updatedPlan } = addProgressLogEntry(parsedPlan, entry);
       if (updatedPlan) {
         changed = true;
+      }
+    }
+
+    // NEW: Structural plan modifications (continuous plan refinement)
+    
+    // Add new tasks
+    if (Array.isArray(planUpdate.addTasks)) {
+      for (const taskSpec of planUpdate.addTasks) {
+        try {
+          addTask(parsedPlan, taskSpec);
+          changed = true;
+        } catch (err) {
+          // Log error but continue processing other updates
+          console.warn('Failed to add task:', err.message);
+        }
+      }
+    }
+
+    // Remove tasks (soft-delete with [REMOVED] prefix)
+    if (Array.isArray(planUpdate.removeTasks)) {
+      for (const taskId of planUpdate.removeTasks) {
+        try {
+          removeTask(parsedPlan, taskId);
+          changed = true;
+        } catch (err) {
+          console.warn('Failed to remove task:', err.message);
+        }
+      }
+    }
+
+    // Revise acceptance checks (add/remove/revise)
+    if (Array.isArray(planUpdate.reviseAcceptanceChecks)) {
+      for (const revision of planUpdate.reviseAcceptanceChecks) {
+        const { action, originalText, newText } = revision;
+        
+        try {
+          if (action === 'add' && newText) {
+            addAcceptanceCheck(parsedPlan, newText);
+            changed = true;
+          } else if (action === 'remove' && originalText) {
+            removeAcceptanceCheck(parsedPlan, originalText);
+            changed = true;
+          } else if (action === 'revise' && originalText && newText) {
+            reviseAcceptanceCheck(parsedPlan, originalText, newText);
+            changed = true;
+          }
+        } catch (err) {
+          console.warn('Failed to revise acceptance check:', err.message);
+        }
       }
     }
 

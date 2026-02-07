@@ -89,6 +89,13 @@ function validateRequiredToolArgs(tool, args) {
     if (!Number.isFinite(sl) || !Number.isFinite(el)) {
       return 'edit_file requires "startLine" and "endLine" as numbers, plus "newText". Respond with JSON: {"tool":"edit_file","args":{"path":"src/App.jsx","startLine":5,"endLine":5,"newText":"import Foo from \\"./Foo\\";\\n"}}';
     }
+    // Guard against destructive edits: replacing a large range with empty/missing newText
+    // will delete all content. If the range spans more than 1 line, newText should not be empty.
+    const rangeSize = el - sl + 1;
+    const ntVal = args.newText;
+    if ((ntVal === undefined || ntVal === null || String(ntVal).trim() === '') && rangeSize > 1) {
+      return `edit_file with lines ${sl}-${el} (${rangeSize} lines) has empty or missing "newText". This would delete all ${rangeSize} lines. Provide the replacement code in "newText". Respond with JSON: {"tool":"edit_file","args":{"path":"${args.path || 'src/file.js'}","startLine":${sl},"endLine":${el},"newText":"// replacement code here"}}`;
+    }
   }
   if (tool === 'move_file') {
     if (!String(args.from || '').trim()) {
@@ -221,6 +228,17 @@ class SingleActionExecutionPhase {
     let anySucceeded = false;
     let lastActionTaken = null;
 
+    // Check consecutive failure count - abort if agent is stuck in a failure loop
+    const MAX_CONSECUTIVE_FAILURES = 6;
+    if (context.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      context.addModelMessage({
+        role: 'user',
+        content: `AGENT STUCK: ${context.consecutiveFailures} consecutive tool failures detected. The agent appears unable to make progress. Try a fundamentally different approach, or use a different tool. Previous approaches have all failed.`
+      });
+      // Reset counter to give the agent one more chance after the warning
+      context.consecutiveFailures = 0;
+    }
+
     for (let i = 0; i < parsed.toolCalls.length; i++) {
       const rawCall = parsed.toolCalls[i];
       const normalizedCall = normalizeToolCall(rawCall);
@@ -252,13 +270,25 @@ class SingleActionExecutionPhase {
         context.incrementActionSeq();
         this.recordReadWriteTracking(context, normalizedCall);
       }
-      if (toolSucceeded) anySucceeded = true;
+      if (toolSucceeded) {
+        anySucceeded = true;
+        // Reset consecutive failure counter on any success
+        context.consecutiveFailures = 0;
+        
+        // NEW: Record observation for continuous plan refinement
+        const observationSummary = this._buildActionObservationSummary(normalizedCall, result);
+        context.recordObservation('action', observationSummary, null);
+      } else {
+        // Track consecutive failures
+        context.consecutiveFailures = (context.consecutiveFailures || 0) + 1;
+      }
       lastActionTaken = normalizedCall.tool;
 
       // Track if this was a successful mutation
       const isMutation = toolSucceeded && this.isMutatingAction(normalizedCall);
       if (isMutation) {
         anyMutation = true;
+        context.lastActionWasMutation = true; // Top-level flag for PlanReflectionPhase
         context.markMutation();
         clearReadCache();
         context.markEvidenceStale();
@@ -520,6 +550,53 @@ class SingleActionExecutionPhase {
     return evidenceId;
   }
 
+  /**
+   * Build compact observation summary for an action
+   * @param {object} normalizedCall - Normalized tool call
+   * @param {object} result - Tool execution result
+   * @returns {string} Compact observation summary
+   * @private
+   */
+  _buildActionObservationSummary(normalizedCall, result) {
+    const { tool, args } = normalizedCall;
+    
+    // Build summary based on tool type
+    if (tool === 'read_file') {
+      const path = args.path || args.file || 'file';
+      const lines = String(result || '').split('\n').length;
+      return `read ${path} (${lines} lines)`;
+    }
+    
+    if (tool === 'edit_file') {
+      const path = args.path || args.file || 'file';
+      return `edited ${path}`;
+    }
+    
+    if (tool === 'create_file') {
+      const path = args.path || args.file || 'file';
+      return `created ${path}`;
+    }
+    
+    if (tool === 'grep_search') {
+      const query = args.query || 'pattern';
+      const matches = String(result || '').split('\n').filter(l => l.includes('match')).length;
+      return `searched for '${query}' (${matches} matches)`;
+    }
+    
+    if (tool === 'semantic_search') {
+      const query = args.query || 'query';
+      return `semantic search for '${query}'`;
+    }
+    
+    if (tool === 'run_command') {
+      const cmd = args.command || 'command';
+      const exitCode = result?.exitCode || 0;
+      return `ran '${cmd}' (exit ${exitCode})`;
+    }
+    
+    // Generic fallback
+    return `executed ${tool}`;
+  }
 }
 
 module.exports = { SingleActionExecutionPhase };

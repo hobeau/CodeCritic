@@ -20,6 +20,12 @@ class FinalizationPhase {
     // Increment step counter
     context.incrementStep();
     
+    // Reset per-iteration inter-phase flags
+    // This ensures CompletionDecisionPhase guard doesn't always fire after first reflection
+    context.planReflected = false;
+    context.planChanged = false;
+    context.lastActionWasMutation = false;
+    
     // Update chat state with current messages
     const chatState = context.getChatState();
     chatState.messages = context.uiMessages;

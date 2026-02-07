@@ -58,6 +58,25 @@ class AgentContext extends BaseContext {
     // Exploration read tracking: used by ActionPolicyPhase auto-readyForPlan heuristic
     // and AgentStrategy confidence-based exploration exit
     this.readActions = Object.create(null);
+
+    // Consecutive failure tracking: abort after too many failures in a row
+    this.consecutiveFailures = 0;
+
+    // Continuous plan refinement: Re-exploration support
+    this.needsReExploration = false;      // Set by PlanReflectionPhase when critical context is missing
+    this.reExplorationReason = null;      // Explanation of what context is missing
+    this.outerLoopCount = 0;              // Tracks how many explore→plan→execute cycles have occurred
+    this.planReflectionCount = 0;         // Tracks total reflections for logging/diagnostics
+
+    // Continuous plan refinement: Per-iteration inter-phase flags
+    // Stored as top-level fields (not context.data) because context.data gets
+    // replaced by each phase's return data and would clobber these flags.
+    this.lastActionWasMutation = false;   // Set by SingleActionExecution, read by PlanReflection
+    this.planReflected = false;           // Set by PlanReflection, read by CompletionDecision
+    this.planChanged = false;             // Set by PlanReflection, read by CompletionDecision
+
+    // Continuous plan refinement: Observation chain
+    this.observations = [];               // Structured observation history [{step, timestamp, type, summary, impactOnPlan}]
   }
 
   /**
@@ -94,6 +113,10 @@ class AgentContext extends BaseContext {
       execute: [
         '[[STAGE:EXECUTE]]',
         'You are now in the **EXECUTION** stage.'
+      ],
+      reflect: [
+        '[[PLAN_REFLECTION]]',
+        'You are reflecting on the current execution plan'
       ]
     };
 
@@ -379,6 +402,47 @@ class AgentContext extends BaseContext {
   }
 
   /**
+   * Record an observation from an action or validation result
+   * Observations are timestamped structured records of what the agent learned
+   * @param {string} type - Type of observation ('action', 'validation', 'reflection')
+   * @param {string} summary - Compact description of observation
+   * @param {string|null} impactOnPlan - Assessment of how this affects the plan (null if no impact)
+   */
+  recordObservation(type, summary, impactOnPlan = null) {
+    const validTypes = ['action', 'validation', 'reflection'];
+    if (!validTypes.includes(type)) {
+      throw new Error(`Invalid observation type: ${type}. Must be one of: ${validTypes.join(', ')}`);
+    }
+    
+    this.observations.push({
+      step: this.actionSeq,
+      timestamp: new Date().toISOString(),
+      type,
+      summary: String(summary || '').trim(),
+      impactOnPlan: impactOnPlan ? String(impactOnPlan).trim() : null
+    });
+  }
+
+  /**
+   * Get the N most recent observations
+   * @param {number} count - Number of recent observations to retrieve (default: 5)
+   * @returns {Array} Recent observations
+   */
+  getRecentObservations(count = 5) {
+    const n = Math.max(1, Math.floor(count));
+    return this.observations.slice(-n);
+  }
+
+  /**
+   * Increment plan reflection counter
+   * @returns {number} New reflection count
+   */
+  incrementPlanReflectionCount() {
+    this.planReflectionCount += 1;
+    return this.planReflectionCount;
+  }
+
+  /**
    * Get a summary object for the current context state (for debugging/logging)
    * @returns {object} Context summary
    */
@@ -398,7 +462,14 @@ class AgentContext extends BaseContext {
       currentPhase: this.currentPhase,
       awaitingHumanInput: this.awaitingHumanInput,
       evidenceStrength: this.getEvidenceStrength(),
-      evidenceStale: this.evidenceStale
+      evidenceStale: this.evidenceStale,
+      outerLoopCount: this.outerLoopCount,
+      planReflectionCount: this.planReflectionCount,
+      needsReExploration: this.needsReExploration,
+      observationCount: this.observations.length,
+      lastActionWasMutation: this.lastActionWasMutation,
+      planReflected: this.planReflected,
+      planChanged: this.planChanged
     };
   }
 }

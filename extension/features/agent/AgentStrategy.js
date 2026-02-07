@@ -22,6 +22,7 @@ const { MarkdownPlanUpdatePhase } = require('./phases/MarkdownPlanUpdatePhase');
 const { ActionPolicyPhase } = require('./phases/ActionPolicyPhase');
 const { SingleActionExecutionPhase } = require('./phases/SingleActionExecutionPhase');
 const { ValidationPhase } = require('./phases/ValidationPhase');
+const PlanReflectionPhase = require('./phases/PlanReflectionPhase'); // NEW
 const { CompletionDecisionPhase } = require('./phases/CompletionDecisionPhase');
 const { FinalizationPhase } = require('./phases/FinalizationPhase');
 
@@ -51,7 +52,7 @@ class AgentStrategy {
       new ExecutionInitializationPhase()     // Explicitly enter execution (mutations allowed)
     ];
     
-    // Main execute loop: reason → plan update → policy → act → observe → verify
+    // Main execute loop: reason → plan update → policy → act → observe → reflect → verify
     this.loopPhases = [
       new StopCheckPhase(),
       new LLMCallPhase(),
@@ -60,6 +61,7 @@ class AgentStrategy {
       new ActionPolicyPhase(),               // Execute-mode: read-before-write gating
       new SingleActionExecutionPhase(),      // Execute tool actions (Act)
       new ValidationPhase(),                 // Acceptance ladder (Observe)
+      new PlanReflectionPhase(),             // NEW: Meta-cognitive plan reflection
       new CompletionDecisionPhase(),         // Evidence-based completion check
       new FinalizationPhase()                // Increment execute step counter
     ];
@@ -79,7 +81,69 @@ class AgentStrategy {
       }
     }
 
-    // Stage 1: Pre-plan exploration loop (read-only)
+    // NEW: Outer loop for continuous plan refinement (explore → plan → execute → reflect → re-explore)
+    const maxOuterLoops = 3;
+    while (context.outerLoopCount < maxOuterLoops) {
+      context.outerLoopCount += 1;
+      
+      // Reset reflection count for this outer loop iteration
+      context.planReflectionCount = 0;
+      context.planReflected = false;
+      context.planChanged = false;
+
+      // Stage 1: Pre-plan exploration loop (read-only)
+      const explorationResult = await this._runExplorationStage(context);
+      if (explorationResult !== 'continue') {
+        return explorationResult;
+      }
+
+      // Stage 2: Summarize exploration, generate/merge plan, capture baseline
+      const planResult = await this._runPlanStage(context);
+      if (planResult !== 'continue') {
+        return planResult;
+      }
+
+      // Stage 3: Main execute loop (mutations allowed)
+      const executeResult = await this._runExecuteStage(context);
+      if (executeResult !== 'continue') {
+        // If execution completed successfully, return success
+        if (executeResult === 'success') {
+          return 'success';
+        }
+        return executeResult;
+      }
+
+      // Check if re-exploration is needed
+      if (!context.needsReExploration) {
+        // Execution did not complete and no re-exploration requested - likely max steps
+        break;
+      }
+
+      // Prepare for re-exploration
+      context.addUiMessage({
+        role: 'assistant',
+        content: `**Re-exploration needed**: ${context.reExplorationReason}\n\nStarting re-exploration cycle ${context.outerLoopCount + 1} of ${maxOuterLoops}...`
+      });
+      
+      this._prepareReExploration(context);
+    }
+
+    // Max outer loops reached
+    if (context.needsReExploration && context.outerLoopCount >= maxOuterLoops) {
+      context.addUiMessage({
+        role: 'assistant',
+        content: `**Note**: Reached maximum re-exploration cycles (${maxOuterLoops}). Completing with current state.`
+      });
+    }
+
+    return this.handleMaxStepsReached(context);
+  }
+
+  /**
+   * Run Stage 1: Pre-plan exploration loop (read-only)
+   * @private
+   */
+  async _runExplorationStage(context) {
     let exitedDueToReadyForPlan = false;
     while (context.prePlanStep < context.prePlanMaxSteps) {
       if (context.awaitingHumanInput) {
@@ -168,15 +232,39 @@ class AgentStrategy {
       });
     }
 
-    // Stage 2: Summarize exploration, generate plan, capture baseline
-    for (const phase of this.postExplorationPhases) {
-      const result = await phase.execute(context);
-      if (!result.isContinue()) {
-        return this.handleNonContinueResult(result, context);
+    return 'continue';
+  }
+
+  /**
+   * Run Stage 2: Summarize exploration, generate/merge plan, capture baseline
+   * @private
+   */
+  async _runPlanStage(context) {
+    // If this is a re-exploration cycle (outerLoopCount > 1), merge findings instead of replacing plan
+    if (context.outerLoopCount > 1) {
+      // Merge re-exploration findings with existing plan
+      const mergeResult = await this._mergeReExplorationFindings(context);
+      if (mergeResult && mergeResult !== 'continue') {
+        return mergeResult;
+      }
+    } else {
+      // First cycle: generate new plan
+      for (const phase of this.postExplorationPhases) {
+        const result = await phase.execute(context);
+        if (!result.isContinue()) {
+          return this.handleNonContinueResult(result, context);
+        }
       }
     }
 
-    // Stage 3: Main execute loop (mutations allowed)
+    return 'continue';
+  }
+
+  /**
+   * Run Stage 3: Main execute loop (mutations allowed)
+   * @private
+   */
+  async _runExecuteStage(context) {
     context.setStage('execute');
 
     // Main ReAct loop
@@ -224,12 +312,90 @@ class AgentStrategy {
         }
       }
       
+      // Check if re-exploration is needed after this iteration
+      if (context.needsReExploration) {
+        return 'continue'; // Signal to outer loop to re-explore
+      }
+      
       // If we completed all phases, continue to next iteration
       // (FinalizationPhase increments step counter)
     }
 
-    // Max steps reached
-    return this.handleMaxStepsReached(context);
+    // Max steps reached in execute loop
+    return 'continue'; // Let outer loop handle max steps
+  }
+
+  /**
+   * Prepare context for re-exploration
+   * Resets exploration state with shorter budget, preserves plan
+   * @private
+   */
+  _prepareReExploration(context) {
+    // Capture reason before resetting (needed for model message)
+    const reason = context.reExplorationReason || 'missing information';
+    
+    // Reset exploration state
+    context.prePlanStep = 0;
+    context.prePlanHasSuccessfulAction = false;
+    context.explorationTruncated = false;
+    
+    // Shorter exploration budget for re-exploration (half of original)
+    const originalBudget = context.prePlanMaxSteps || 3;
+    context.prePlanMaxSteps = Math.max(1, Math.floor(originalBudget / 2));
+    
+    // Reset needsReExploration flag
+    context.needsReExploration = false;
+    context.reExplorationReason = null;
+    
+    // Preserve plan, evidence, and observations - we're adding to existing context
+    // No need to reset markdownPlan, parsedPlan, baseline, evidence, observations
+    
+    // Add model message with re-exploration context
+    context.addModelMessage({
+      role: 'user',
+      content: `Re-exploration phase: The plan requires additional context. Focus exploration on: ${reason}. You have ${context.prePlanMaxSteps} exploration steps.`
+    });
+  }
+
+  /**
+   * Merge re-exploration findings with existing plan
+   * Appends new findings to the plan's Findings section
+   * @private
+   * @returns {Promise<string>} 'continue' if successful, or error result
+   */
+  async _mergeReExplorationFindings(context) {
+    // Run ExplorationSummaryPhase to generate new findings
+    const summaryPhase = new ExplorationSummaryPhase();
+    const result = await summaryPhase.execute(context);
+    
+    if (!result.isContinue()) {
+      return this.handleNonContinueResult(result, context);
+    }
+    
+    // Get existing plan and new exploration summary
+    const parsedPlan = context.getParsedPlan();
+    const newFindings = result.data?.explorationSummary || '';
+    
+    if (!parsedPlan || !newFindings) {
+      return 'continue'; // No findings to merge, continue anyway
+    }
+    
+    // Append new findings to existing findings
+    const { updateFindings } = require('./utils/MarkdownPlanManager');
+    const currentFindings = parsedPlan.findings?.openQuestions || '';
+    const mergedFindings = currentFindings 
+      ? `${currentFindings}\n\n**Re-exploration findings**:\n${newFindings}`
+      : newFindings;
+    
+    updateFindings(parsedPlan, 'openQuestions', mergedFindings);
+    context.updateParsedPlan(parsedPlan);
+    
+    context.addUiMessage({
+      role: 'assistant',
+      content: `**Re-exploration complete**: New findings merged into plan.\n\n${newFindings}`
+    });
+    
+    return 'continue';
   }
 
   /**

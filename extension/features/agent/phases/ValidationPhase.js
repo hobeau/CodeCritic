@@ -48,6 +48,11 @@ class ValidationPhase {
       // Store evidence
       context.recordEvidence(evidence);
       
+      // NEW: Record observation for continuous plan refinement
+      const observationSummary = this._buildObservationSummary(evidence);
+      const impactOnPlan = this._assessImpactOnPlan(context, evidence);
+      context.recordObservation('validation', observationSummary, impactOnPlan);
+      
       // Auto-update acceptance checks based on evidence
       this.updateAcceptanceChecksFromEvidence(context, evidence);
 
@@ -63,7 +68,7 @@ class ValidationPhase {
       
       // Build enhanced guidance when diagnostics show new problems
       let guidance = 'Analyze these results and determine next steps.';
-      const baseline = context.getBaseline ? context.getBaseline() : {};
+      const baseline = context.baseline || {};
       const baselineCount = baseline?.diagnostics?.count || 0;
       const currentCount = evidence?.diagnostics?.count || 0;
       if (currentCount > baselineCount && evidence?.diagnostics?.problems?.length) {
@@ -429,6 +434,82 @@ class ValidationPhase {
     }
     
     return parts.length > 0 ? parts.join('\n') : '- ⚠️ No validation data collected';
+  }
+
+  /**
+   * Build compact observation summary from evidence
+   * @param {object} evidence - Validation evidence
+   * @returns {string} Compact observation summary
+   * @private
+   */
+  _buildObservationSummary(evidence) {
+    const parts = [];
+    
+    if (evidence.build) {
+      const status = evidence.build.error ? 'error' : (evidence.build.success ? 'pass' : 'fail');
+      parts.push(`build:${status}`);
+    }
+    
+    if (evidence.tests) {
+      if (evidence.tests.error) {
+        parts.push(`tests:error`);
+      } else {
+        const passed = evidence.tests.passedCount || 0;
+        const failed = evidence.tests.failedCount || 0;
+        parts.push(`tests:${passed} pass, ${failed} fail`);
+      }
+    }
+    
+    if (evidence.diagnostics) {
+      const count = evidence.diagnostics.count || 0;
+      const status = evidence.diagnostics.clean ? 'clean' : `${count} issues`;
+      parts.push(`diag:${status}`);
+    }
+    
+    return parts.join(', ');
+  }
+
+  /**
+   * Assess impact of validation evidence on the plan
+   * @param {AgentContext} context - Execution context
+   * @param {object} evidence - Validation evidence
+   * @returns {string|null} Impact assessment or null if no significant impact
+   * @private
+   */
+  _assessImpactOnPlan(context, evidence) {
+    const baseline = context.baseline || {};
+    const impacts = [];
+    
+    // Check for build regression
+    if (baseline.build?.success && evidence.build && !evidence.build.success) {
+      impacts.push('build regressed from pass to fail');
+    }
+    
+    // Check for test regression
+    if (evidence.tests && baseline.tests) {
+      const currentFails = evidence.tests.failedCount || 0;
+      const baselineFails = baseline.tests.failedCount || 0;
+      const delta = currentFails - baselineFails;
+      if (delta > 0) {
+        impacts.push(`${delta} new test${delta > 1 ? 's' : ''} failing`);
+      } else if (delta < 0) {
+        impacts.push(`${Math.abs(delta)} test${Math.abs(delta) > 1 ? 's' : ''} fixed`);
+      }
+    }
+    
+    // Check for diagnostics regression/improvement
+    if (evidence.diagnostics && baseline.diagnostics) {
+      const currentCount = evidence.diagnostics.count || 0;
+      const baselineCount = baseline.diagnostics.count || 0;
+      const delta = currentCount - baselineCount;
+      if (delta > 0) {
+        impacts.push(`${delta} new diagnostic${delta > 1 ? 's' : ''} introduced — may need additional fix tasks`);
+      } else if (delta < 0) {
+        impacts.push(`${Math.abs(delta)} diagnostic${Math.abs(delta) > 1 ? 's' : ''} resolved`);
+      }
+    }
+    
+    return impacts.length > 0 ? impacts.join('; ') : null;
   }
 }
 
